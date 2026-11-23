@@ -1,0 +1,209 @@
+{
+  "_comment": [
+    "The meets the seeded roster competes in, and the ONE place they are named.",
+    "",
+    "Committed and hand-maintained, read by both stacks: Server/scripts/createCompetitions.js",
+    "creates them, and Web/e2e/support/meets.js resolves a place to its level so a",
+    "seeding run can pick the right level on the post-login chooser. Before this",
+    "file the places lived in createCompetitions.js and the place-to-level map was",
+    "copied into the e2e helpers by hand, where drift did not fail loudly: picking",
+    "the level a meet is NOT at simply finds no competitions, and the run dies on",
+    "'Nothing at X Level', which reads like missing seed data rather than a stale map.",
+    "",
+    "Twenty meets over all six levels, laddered through the season so district runs",
+    "first and DSO last: three each at district, state, national and international, four",
+    "each at university and DSO (added 2026-10-24 for the lifecycle check). The year field",
+    "stays 2026 for the 2027 dates because a meet is the SEASON's, and the season slide",
+    "moves every date anyway. Dates are Saturdays, verified rather than",
+    "assumed; each meet ends the following day. The competition status rules key off",
+    "these -- 'ongoing' is refused before the start date, and a started meet cannot be",
+    "deleted -- so they sit far enough out to keep every meet in 'upcoming'.",
+    "",
+    "Places must stay distinct: a meet is identified by name + place + year, so two",
+    "meets sharing a place would be the same competition."
+  ],
+  "name": "Bhausaheb Ranade Navodit",
+  "year": 2026,
+  "meets": [
+    {
+      "place": "Mumbai",
+      "level": "district",
+      "startDate": "2026-10-03",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Pune",
+      "level": "district",
+      "startDate": "2026-10-10",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2"
+      ]
+    },
+    {
+      "place": "Nashik",
+      "level": "district",
+      "startDate": "2026-10-17",
+      "competitionTypes": [
+        "competition_1",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Nagpur",
+      "level": "state",
+      "startDate": "2026-10-24",
+      "competitionTypes": [
+        "competition_1"
+      ]
+    },
+    {
+      "place": "Kolhapur",
+      "level": "state",
+      "startDate": "2026-10-31",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Aurangabad",
+      "level": "state",
+      "startDate": "2026-11-07",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2"
+      ]
+    },
+    {
+      "place": "Delhi",
+      "level": "national",
+      "startDate": "2026-11-14",
+      "competitionTypes": [
+        "competition_1",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Bengaluru",
+      "level": "national",
+      "startDate": "2026-11-21",
+      "competitionTypes": [
+        "competition_1"
+      ]
+    },
+    {
+      "place": "Chennai",
+      "level": "national",
+      "startDate": "2026-11-28",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Goa",
+      "level": "international",
+      "startDate": "2026-12-05",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2"
+      ]
+    },
+    {
+      "place": "Hyderabad",
+      "level": "international",
+      "startDate": "2026-12-12",
+      "competitionTypes": [
+        "competition_1",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Kolkata",
+      "level": "international",
+      "startDate": "2026-12-19",
+      "competitionTypes": [
+        "competition_1"
+      ]
+    },
+    {
+      "place": "Varanasi",
+      "level": "university",
+      "startDate": "2026-12-26",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Bhopal",
+      "level": "university",
+      "startDate": "2027-01-02",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2"
+      ]
+    },
+    {
+      "place": "Jaipur",
+      "level": "university",
+      "startDate": "2027-01-09",
+      "competitionTypes": [
+        "competition_1",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Indore",
+      "level": "university",
+      "startDate": "2027-01-16",
+      "competitionTypes": [
+        "competition_1"
+      ]
+    },
+    {
+      "place": "Thane",
+      "level": "dso",
+      "startDate": "2027-01-23",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Satara",
+      "level": "dso",
+      "startDate": "2027-01-30",
+      "competitionTypes": [
+        "competition_1",
+        "competition_2"
+      ]
+    },
+    {
+      "place": "Ratnagiri",
+      "level": "dso",
+      "startDate": "2027-02-06",
+      "competitionTypes": [
+        "competition_1",
+        "competition_3"
+      ]
+    },
+    {
+      "place": "Latur",
+      "level": "dso",
+      "startDate": "2027-02-13",
+      "competitionTypes": [
+        "competition_1"
+      ]
+    }
+  ]
+}

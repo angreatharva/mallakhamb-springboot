@@ -1,0 +1,88 @@
+---
+doc: 06-SCREENS/judge-profile
+covers:
+  - src/pages/judge/JudgeProfile.jsx
+read_when: "changing the judge's own account/profile screen"
+depends_on: [13-FORMS-AND-VALIDATION]
+verified_against_commit: f5465b4
+last_verified: 2026-11-11
+---
+
+## What it is
+
+`src/pages/judge/JudgeProfile.jsx` (457 lines), route `/judge/profile`.
+A straightforward CRUD screen — no socket usage, no panel/scoring data.
+Comment at the bottom (`:443-450`) is explicit about scope: *"the panels
+they sit on are shown on the dashboard instead — that is the first
+thing a judge needs on opening the app, and it is not something they
+can change from here in any case."*
+
+## Two independent forms
+
+Both via separate `react-hook-form` instances (no shared form state):
+- **Account details** — name, email, phone, stateUnit, MFI registration
+  number, certification level dropdown — saved via
+  `judgeAPI.updateProfile`.
+- **Password change** — current/new/confirm — via
+  `judgeAPI.changePassword`. Client-side validation: min 8 chars +
+  uppercase + lowercase + digit regex (`:404-409`); confirm-match
+  validated against `watchPassword('newPassword')`.
+
+## Photo upload — client-side downscale, and why
+
+`downscaleImage(file, 256)` (`:36-54`) does a client-side canvas
+downscale to a 256px JPEG data URL before sending. Comment explains
+photos are stored **inline on the account document** — no object
+storage in this project, and the deployment disk is ephemeral — so the
+client must keep the image small to avoid the API body size limit.
+
+## Non-obvious behavior
+
+On successful profile save, the stored `judge_user` in `secureStorage`
+is patched with the new `name`/`email` (`:148-162`) — "so a rename has
+to land there too or the dashboard keeps greeting the old name." If
+you add a new editable field here that other screens read off
+`judge_user`, patch it into storage the same way on save.
+
+## Change guidance
+
+- If adding a new photo/file upload elsewhere in the app: check whether
+  it needs the same client-side downscale — the inline-storage
+  constraint (no object storage, ephemeral disk) applies wherever
+  photos are stored on a document rather than externally.
+
+## Since the last pass (2026-10-18)
+
+- Restyled in the 2026-10 "prime-time" design-language pass (shared `ui/` primitives,
+  tokens, no colour literals); behaviour otherwise unchanged. Line numbers (`:NNN`)
+  above predate it and are approximate — search by the named function.
+
+## Since the last pass (2026-10-21, `ff89ca5`)
+
+- The password section is now the shared `PasswordSection`, and an **email
+  section** was added (`EmailSection`) — both from
+  `pages/shared/account/AccountSections.jsx`, on the `/auth/me/*` endpoints.
+  The judge profile no longer edits the email directly (the server dropped
+  `email` from `PUT /judge/profile`); a new address has to prove itself with
+  a code first.
+- Loads `judgeAPI.getProfile()` and `accountAPI.get()` together; `#password`
+  / `#email` in the URL scroll to those sections (the account menu's targets).
+  See [account-and-player-identity.md](account-and-player-identity.md).
+
+## Since the last pass (2026-11-03, judge home + profile redesign)
+
+- Same shell as `AccountProfile`: a fixed `AppHeader` (role judge, name as
+  segment, Account menu, Light/Dark, Logout, phone drawer) replaces the bare
+  back link + corner `AppearanceMenu`. The hero is `JudgeIdentity.jsx` (photo
+  upload + `downscaleImage` moved there, unchanged), shared with nothing else
+  yet.
+- Tabs **Profile | Panels | Marking insights** (`?tab=panels`, `?tab=stats`).
+  Panels = `JudgePanelHistory.jsx` over `profile.assignments` (already in
+  `GET /judge/profile`), grouped by meet; a finished meet
+  (`isCompetitionLocked`) is tagged "Completed · view only". The form heading
+  is now "My profile". Tests: `JudgeProfile.test.jsx`.
+
+## Since the last pass (2026-11-11, against `f5465b4`)
+
+- The Panels tab has a search. The level options are International,
+  National, State and District.

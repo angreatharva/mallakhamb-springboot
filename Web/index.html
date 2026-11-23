@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- The pole mark (design-language PLAN D9). PNG for browsers without SVG favicons; iOS home screen. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Appearance (dark | light). The two tags let a browser colour its own
+      chrome from the OS setting; appearance-init.js overrides both when the
+      person has chosen explicitly (the default is dark). The script is a
+      blocking CLASSIC script, placed before any stylesheet, so the first paint
+      is already in the right appearance — see src/utils/ui/appearance.js.
+    -->
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f3eee6" media="(prefers-color-scheme: light)" />
+    <script src="/appearance-init.js"></script>
+    <!--
+      The landing page's hero photograph is a bundled local file with a hashed
+      URL, so it is preloaded from src/pages/public/home/preload.js, not here.
+    -->
+    <script>
+      if (location.pathname === '/') {
+        // Home is the laptop layout on every device (see src/pages/public/home/desktopViewport.js;
+        // keep this string identical to DESKTOP_VIEWPORT there).
+        document.querySelector('meta[name="viewport"]').setAttribute('content', 'width=1280');
+      }
+    </script>
+    <!-- CSP: unsafe-inline/unsafe-eval required for React/Vite in development -->
+    <!-- For production: Consider implementing nonce-based CSP -->
+    <!--
+      frame-ancestors is deliberately NOT in the policy below. Browsers ignore
+      that directive when it arrives via <meta> and log an error for it on every
+      single page load, which buried real console output. It only works as a
+      response header, so it is set in two places instead:
+        - render.yaml, for the deployed static site
+        - vite.config.js `server.headers`, so dev matches production
+    -->
+    <!-- (X-Frame-Options: DENY is also set in render.yaml for older browsers.) -->
+    <!--
+      worker-src is set EXPLICITLY because it falls back to script-src when it
+      is not, and script-src has no `blob:` — so anything spawning a worker from
+      a blob URL is blocked with "Note that 'worker-src' was not explicitly set".
+      Razorpay's checkout.js does exactly that, which put this on the payment
+      page rather than anywhere obvious; it first surfaced as a console error in
+      a seeding run. `blob:` here is the worker's own source, not a script
+      origin, so it does not widen what may be loaded and executed as a script.
+    -->
+    <!--
+      connect-src lists BOTH SPELLINGS OF LOOPBACK, and that is not redundancy.
+
+      `localhost` and `127.0.0.1` are the same machine, but CSP matches the
+      host STRING and not the address it resolves to — so a policy naming only
+      one of them blocks the other. That bit whenever the API was addressed as
+      127.0.0.1: every call failed as a bare axios "Network Error", with no
+      request in the server log and nothing on screen pointing at a policy,
+      because a CSP refusal never reaches the network at all.
+
+      Both spellings are unavoidable together. Node's fetch resolves `localhost`
+      to ::1 on Windows while the API listens on IPv4, so the seeding scripts
+      have to say 127.0.0.1 — while the BROWSER has to be given a host this
+      policy names. `vite.config.js` already allows the pair in `allowedHosts`
+      for the same reason.
+
+      No widening: an origin that can reach one loopback spelling can reach the
+      other, and a page that may talk to its own machine at all may already do
+      so via `localhost:*`. (`[::1]` is deliberately absent — CSP's host grammar
+      has no place for an IPv6 literal, so browsers discard the source
+      expression as invalid and log a warning on every page load.)
+    -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self';
+                   script-src 'self' 'unsafe-inline' 'unsafe-eval' https://checkout.razorpay.com https://cdn.razorpay.com;
+                   worker-src 'self' blob:;
+                   style-src 'self' 'unsafe-inline';
+                   img-src 'self' data: https:;
+                   font-src 'self' data:;
+                   connect-src 'self' https://api.razorpay.com https://checkout.razorpay.com https://lumberjack.razorpay.com https://*.onrender.com https://*.ngrok-free.app https://*.ngrok.io http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:* wss://*.onrender.com https://api-137-23-63-84.sslip.io wss://api-137-23-63-84.sslip.io https://api.mallakhambcompetition.com wss://api.mallakhambcompetition.com wss://*.ngrok-free.app wss://*.ngrok.io;
+                   frame-src 'self' https://api.razorpay.com https://checkout.razorpay.com;
+                   base-uri 'self';
+                   form-action 'self' https://api.razorpay.com;">
+    <meta name="csrf-token" content="">
+    <!-- Additional security headers (also configure on server) -->
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <title>Mallakhamb India</title>
+    <meta name="description" content="Registration, judging and live results for pole, hanging pole and rope Mallakhamb." />
+    <link rel="canonical" href="https://www.mallakhambcompetition.com/" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Mallakhamb India" />
+    <meta property="og:title" content="Mallakhamb India" />
+    <meta property="og:description" content="Registration, judging and live results for pole, hanging pole and rope Mallakhamb." />
+    <meta property="og:url" content="https://www.mallakhambcompetition.com/" />
+    <meta property="og:image" content="https://www.mallakhambcompetition.com/logo-512.png" />
+    <meta name="twitter:card" content="summary" />
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Organization",
+          "@id": "https://www.mallakhambcompetition.com/#organization",
+          "name": "Mallakhamb India",
+          "url": "https://www.mallakhambcompetition.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "url": "https://www.mallakhambcompetition.com/logo-512.png",
+            "width": 512,
+            "height": 512
+          }
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.mallakhambcompetition.com/#website",
+          "url": "https://www.mallakhambcompetition.com/",
+          "name": "Mallakhamb India",
+          "publisher": { "@id": "https://www.mallakhambcompetition.com/#organization" }
+        }
+      ]
+    }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

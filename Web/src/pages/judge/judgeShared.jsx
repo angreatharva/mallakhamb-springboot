@@ -1,0 +1,1012 @@
+/**
+ * Shared judge scoring UI
+ *
+ * Atoms, modals and helpers used by BOTH the scoring page (JudgeScoring) and
+ * the panel review page (JudgePanelReview). Extracted so the two routes can be
+ * separate files without duplicating this markup.
+ */
+import { useState, useEffect, forwardRef, createContext, useContext } from 'react';
+import PropTypes from 'prop-types';
+import { AlertTriangle, ArrowLeft, CheckCircle, LogOut, Save, X } from 'lucide-react';
+import AppearanceMenu from '@/components/layout/AppearanceMenu';
+import { PoleMark } from '@/components/brand/Brand';
+import { RoleIdent } from '@/components/shell';
+import { IconButton } from '@/components/ui';
+import { AnimatePresence } from 'framer-motion';
+import { FG, alpha } from '@/styles/tokens';
+import {
+  panelScoresShape,
+  editTargetShape,
+  combinationChecklistShape,
+  pointCeilingsShape,
+} from '@/utils/scoring/scoringPropTypes';
+import { PANEL_TYPES } from '@/utils/scoring/judgePanel';
+import toast from 'react-hot-toast';
+import { roundExecution, isExecutionEntered, EXECUTION_TOO_LOW_MESSAGE, describeSlipDifferences, difficultyClassMax } from '@/utils/scoring/copRules';
+import { BodyScrollLock } from '@/hooks/useBodyScrollLock';
+
+export const SCORING_PATH = '/judge/scoring';
+export const PANEL_REVIEW_PATH = '/judge/scoring/panel-review';
+
+/**
+ * Panel judge slots, in display order.
+ *
+ * Re-exported rather than declared: the list now also decides which rows
+ * `utils/scoring/judgePanel.js` folds into a panel, and a second copy here
+ * would let the display order and the panel SIZE disagree about what a seat is.
+ */
+export { PANEL_TYPES };
+
+/** sessionStorage key holding the active scoring session across refreshes. */
+export const ACTIVE_SESSION_KEY = 'judge_scoring_active_session';
+
+/** Players arrive from several endpoints with inconsistent id fields. */
+export const playerIdOf = (player) => player?.id || player?._id;
+
+/**
+ * localStorage key for a judge's unsubmitted slip marks. Shared by the slip,
+ * which autosaves under it, and Panel Review, which clears it before the judge
+ * goes back to edit — so the edit opens on the SUBMITTED slip, not on the
+ * leftovers of an edit that was abandoned earlier.
+ */
+export const scoringCacheKey = (team, player, judgeInfo) => (
+  team && player
+    ? `judge_scores_${team._id}_${playerIdOf(player)}_${judgeInfo?.judgeType || 'unknown'}`
+    : null
+);
+
+/**
+ * Coerce a stored/emitted breakdown into the shape the UI renders, filling in
+ * zeros for anything missing.
+ */
+/**
+ * Edit My Score allowance per slip — every panel judge, the Senior Judge
+ * included (user rule 2026-11-09). Mirrors SLIP_EDIT_LIMIT in
+ * Server/src/utils/scoring/judge-slip.util.js; an admin or superadmin
+ * restores it.
+ */
+export const SLIP_EDIT_LIMIT = 3;
+
+/**
+ * What the judge is told they have: one fewer than SLIP_EDIT_LIMIT (owner,
+ * 2026-11-17: "max 3 but we will show 2 max"). The third edit is a spare the
+ * label never counts, so "0 of 2 edits left" still lets one more edit through.
+ */
+export const SHOWN_EDIT_LIMIT = SLIP_EDIT_LIMIT - 1;
+
+export const normalizeBreakdown = (breakdown, fallbackScore) => {
+  if (!breakdown) {
+    return {
+      difficulty: { aClass: 0, bClass: 0, cClass: 0, total: 0 },
+      combination: { checked: {}, total: 0 },
+      execution: 0,
+      bonus: 0,
+    };
+  }
+  const difficulty = breakdown.difficulty || { aClass: 0, bClass: 0, cClass: 0, total: 0 };
+  const combination = {
+    total: breakdown.combination?.total ?? 0,
+    checked: breakdown.combination?.checked || {},
+  };
+  const execution = typeof breakdown.execution === 'number'
+    ? breakdown.execution
+    : parseFloat(breakdown.execution) || 0;
+  const bonus = parseFloat(breakdown.bonus ?? breakdown.originality ?? 0) || 0;
+  // false when only the section totals are known (see slipToBreakdown)
+  const detailed = breakdown.detailed !== false;
+  return { difficulty, combination, execution, bonus, detailed, _score: fallbackScore };
+};
+
+/*
+ * The judge screens' colours, as tokens (design-language PLAN W4): the names
+ * stay so the screens read the same, the values follow the look pack. The
+ * "purple" was the judge role accent; it is the accent now, whatever the role
+ * colour of the look.
+ */
+export const J = {
+  purple: 'rgb(var(--accent))',
+  purpleLight: 'rgb(var(--accent-fg))',
+  purpleDark: 'rgb(var(--accent))',
+  green: 'rgb(var(--success-fg))',
+  greenDark: 'rgb(var(--success-fg))',
+  amber: 'rgb(var(--warning-fg))',
+};
+
+export const EASE_OUT = [0.25, 0.46, 0.45, 0.94];
+
+// ─── Difficulty Picker ────────────────────────────────────────────────────────
+//
+// One element class (A 0.20, B 0.40, C 0.60): a 1–10 grid to set the count in
+// a single tap, and a vertical − / count / + stepper beside it for anything
+// the grid does not cover (0, or more than 10). Tapping the number already
+// chosen keeps it — it used to clear back to 0, and a second tap (or a
+// double-tap on a phone) wiped the count the judge had just picked. Clearing
+// is the − stepper's job.
+//
+// Accessible names are kept stable for the e2e flows: the stepper buttons are
+// "Increase A - Class - 0.20" / "Decrease …" (Web/e2e/support/scoring-flows.js)
+// and each number is "A - Class - 0.20: 4".
+
+const PICKER_NUMBERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+/**
+ * True while a slip is view-only (its competition has finished). The slip's
+ * controls read it and disable themselves, so the marks stay visible but can't
+ * change — the server refuses the write anyway (423).
+ */
+export const SlipReadOnly = createContext(false);
+
+/*
+ * `points` / `max` (optional): what this class SCORES and the most it can
+ * (user rule 2026-11-08 — Competition I A 0.80 / B 2.40 / C 0.60, II-III
+ * A 0.20 / B 2.40 / C 1.20). The row used to print the raw count × value
+ * ("8 × 0.20 = 1.60"), more than the class can ever be worth. Given them, the
+ * row shows the scored figure, never above its maximum.
+ */
+export const DifficultyPicker = ({ cls, value, count, onChange, compact = false, points, max }) => {
+  const readOnly = useContext(SlipReadOnly);
+  const name = `${cls} - Class - ${value.toFixed(2)}`;
+  const n = Number(count) || 0;
+  // Compact (the Senior Judge's edit dialog) only with a mouse. On touch it is the slip's own size: at h-9 the
+  // count between − and + shrank to ~20px, the two 15px tap extensions overlapped there, and a tap just below
+  // − landed on + (drawn later, so on top).
+  const cell = compact ? 'h-11 text-base mouse:h-9 mouse:text-sm' : 'h-11 text-base';
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-2">
+        <span className="type-tag text-fg-secondary">
+          {cls} - {value.toFixed(2)}
+        </span>
+        {typeof points === 'number' && typeof max === 'number' ? (
+          <span className="text-xs tabular-nums text-fg-muted" data-testid={`difficulty-${cls}-points`}>
+            <span className={points >= max - 1e-9 ? 'font-bold text-success-fg' : 'font-bold text-fg'}>{points.toFixed(2)}</span>
+            {' '}/ max {max.toFixed(2)}
+          </span>
+        ) : (
+          <span className="text-xs tabular-nums text-fg-muted">
+            {n} × {value.toFixed(2)} = {(n * value).toFixed(2)}
+          </span>
+        )}
+      </div>
+      <div className="flex items-stretch gap-2 sm:gap-3">
+        <div className="grid grid-cols-5 gap-1.5 sm:gap-2 flex-1 min-w-0" role="group" aria-label={`${name} count`}>
+          {PICKER_NUMBERS.map((num) => {
+            const selected = n === num;
+            return (
+              <button
+                key={num}
+                type="button"
+                aria-label={`${name}: ${num}`}
+                aria-pressed={selected}
+                disabled={readOnly}
+                onClick={() => { if (!selected) onChange(num); }}
+                className={`${cell} rounded-xl border font-black tabular-nums select-none transition-[background-color,border-color,color,transform] duration-150 active:scale-95`}
+                style={{
+                  background: selected ? 'rgb(var(--accent))' : 'rgb(var(--ink) / 0.03)',
+                  borderColor: selected ? J.purple : 'rgb(var(--ink) / 0.12)',
+                  color: selected ? 'rgb(var(--on-accent))' : 'var(--fg)',
+                  boxShadow: selected ? `0 0 0 3px ${alpha(J.purple, 0x25)}` : 'none',
+                  touchAction: 'manipulation',
+                }}
+              >
+                {num}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* − on top, the count, + below — as drawn */}
+        <div className={`${compact ? 'w-14 mouse:w-12' : 'w-14'} flex-shrink-0 flex flex-col rounded-xl border overflow-hidden`}
+          style={{ borderColor: 'rgb(var(--ink) / 0.12)', background: 'rgb(var(--ink) / 0.04)' }}>
+          <button type="button" aria-label={`Decrease ${name}`} disabled={readOnly || n <= 0}
+            onClick={() => onChange(Math.max(0, n - 1))}
+            className="relative flex-1 flex items-center justify-center text-lg font-black select-none disabled:cursor-not-allowed active:bg-ink/10 before:content-[''] before:absolute before:inset-x-0 before:top-0 before:-bottom-[16px]"
+            style={{ color: n <= 0 ? 'rgb(var(--ink) / 0.15)' : 'rgb(var(--accent-fg))', borderBottom: '1px solid rgb(var(--ink) / 0.08)', touchAction: 'manipulation' }}>
+            −
+          </button>
+          <span className="flex items-center justify-center py-1 text-xl font-black tabular-nums text-ink select-none">
+            {n}
+          </span>
+          <button type="button" aria-label={`Increase ${name}`} disabled={readOnly}
+            onClick={() => onChange(n + 1)}
+            className="relative flex-1 flex items-center justify-center text-lg font-black select-none active:bg-ink/10 before:content-[''] before:absolute before:inset-x-0 before:bottom-0 before:-top-[16px]"
+            style={{ color: 'rgb(var(--accent-fg))', borderTop: '1px solid rgb(var(--ink) / 0.08)', touchAction: 'manipulation' }}>
+            +
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+DifficultyPicker.propTypes = {
+  cls: PropTypes.oneOf(['A', 'B', 'C']).isRequired,
+  value: PropTypes.number.isRequired,
+  count: PropTypes.number,
+  onChange: PropTypes.func.isRequired,
+  compact: PropTypes.bool,
+  points: PropTypes.number,
+  max: PropTypes.number,
+};
+
+/** The three classes, in the order drawn: [stateKey, class letter, value]. */
+export const DIFFICULTY_CLASSES = Object.freeze([
+  ['aClass', 'A', 0.20],
+  ['bClass', 'B', 0.40],
+  ['cClass', 'C', 0.60],
+]);
+
+// ─── Decimal Input ────────────────────────────────────────────────────────────
+//
+// A mark field that never shows a leading "0". A `type="number"` input bound
+// to a numeric 0 renders "0", and typing 3 then reads "03" — React will not
+// rewrite it because "03" equals 3. So the field keeps the text the judge is
+// typing, strips leading zeros ("03" → "3", "0.5" stays), shows the
+// placeholder instead of a literal 0, and reports the parsed number upward.
+// The parent may round or clamp it; when that changes the number, the text
+// is re-synced to what the parent kept.
+//
+// `impliedDecimal` (the Execution field, user rule 2026-11-15): digits typed
+// WITHOUT a point read as d.dd — the first digit is the whole number and the
+// rest are decimals — so a judge can type 220 for 2.20, 010 for 0.10 and 440
+// for 4.40 without hunting for the "." key. Typing the point (2.20) works as
+// before. At most three digits without a point; a 4th is ignored. A single
+// digit is still a whole mark (3 → 3.00), so nothing typed today changes.
+// A kept mark always READS with two decimals — 2.20, never 2.2 (owner,
+// 2026-11-17: "while display it must show 2.20 but while typing 220").
+const toDraft = (v) => (Number(v) ? Number(v).toFixed(2) : '');
+
+/** The mark a draft stands for: "220" → 2.2 with implied decimals, else as written. */
+export const parseDecimalDraft = (text, impliedDecimal = false) => {
+  const t = String(text ?? '');
+  if (impliedDecimal && /^\d{2,}$/.test(t)) return Number(t) / 10 ** (t.length - 1);
+  return parseFloat(t) || 0;
+};
+
+export const DecimalInput = ({ value, onValueChange, onBlur, placeholder = '0.00', impliedDecimal = false, ...rest }) => {
+  const [draft, setDraft] = useState(() => toDraft(value));
+
+  useEffect(() => {
+    setDraft((d) => (Math.abs(parseDecimalDraft(d, impliedDecimal) - (Number(value) || 0)) < 1e-9 ? d : toDraft(value)));
+  }, [value, impliedDecimal]);
+
+  const handleChange = (e) => {
+    const text = e.target.value.replace(/,/g, '.');
+    if (!/^\d*\.?\d*$/.test(text)) return;
+    const noPoint = !text.includes('.');
+    // Implied decimals keep the leading zero ("010" is 0.10) and stop at d.dd.
+    if (impliedDecimal && noPoint && text.length > 3) return;
+    const cleaned = impliedDecimal && noPoint ? text : text.replace(/^0+(?=\d)/, '');
+    setDraft(cleaned);
+    onValueChange(parseDecimalDraft(cleaned, impliedDecimal));
+  };
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      autoComplete="off"
+      value={draft}
+      onChange={handleChange}
+      // Rounding can leave the number unchanged ("3.02" → 3.00), in which case
+      // the effect above never fires — snap the text to the kept value here.
+      onBlur={(e) => { setDraft(toDraft(value)); onBlur?.(e); }}
+      placeholder={placeholder}
+      {...rest}
+    />
+  );
+};
+
+DecimalInput.propTypes = {
+  value: PropTypes.oneOfType([PropTypes.number, PropTypes.string]),
+  onValueChange: PropTypes.func.isRequired,
+  onBlur: PropTypes.func,
+  placeholder: PropTypes.string,
+  impliedDecimal: PropTypes.bool,
+};
+
+// ─── Mismatch Modal ───────────────────────────────────────────────────────────
+//
+// Difficulty and Combination only. A tolerance breach is a different failure —
+// the panel agrees on the routine and disagrees on how well it was done — and
+// gets its own dialog below, so a judge is never shown one alert that mixes
+// "you recorded a different element mix" with "your execution mark is an
+// outlier".
+export const MismatchModal = ({ isOpen, onClose, panelMismatch, panelScores, isSeniorJudge, myJudgeType, judgeNameMap, combinationChecklist }) => {
+  if (!isOpen) return null;
+  const short = (jt) => (jt === 'Senior Judge' ? 'SR' : jt.replace('Judge ', 'J'));
+  const who = (jt) => `${short(jt)}${judgeNameMap?.[jt] ? ` · ${judgeNameMap[jt]}` : ''}`;
+  const signed = (v) => `${v > 0 ? '+' : v < 0 ? '−' : '±'}${Math.abs(v).toFixed(2)}`;
+
+  /*
+   * WHAT exactly differs (user rule 2026-11-07), one block per off judge:
+   * the totals and their gap, then each A/B/C count, or each checklist
+   * requirement, the judge marked differently from the Senior Judge. The
+   * Senior Judge sees every off judge; a panel judge sees only their own.
+   */
+  const DiffDetails = ({ jt, section }) => {
+    const senior = panelScores?.['Senior Judge'];
+    const entry = panelScores?.[jt];
+    if (!senior || !entry) return null;
+    const d = describeSlipDifferences(senior, entry, combinationChecklist)[section];
+    const gap = d.judge - d.senior;
+    const youOrThem = isSeniorJudge ? short(jt) : 'You';
+    return (
+      <div className="mt-2 rounded-lg border p-3 text-xs space-y-1.5"
+        style={{ background: 'rgb(var(--danger-fg) / 0.05)', borderColor: 'rgb(var(--danger-fg) / 0.22)' }}
+        data-testid={`mismatch-detail-${section}-${jt}`}>
+        <p className="font-bold text-ink">
+          {isSeniorJudge ? who(jt) : 'Your slip'}: {d.judge.toFixed(2)} vs SR {d.senior.toFixed(2)}
+          <span style={{ color: FG.danger }}> ({signed(gap)})</span>
+        </p>
+        {section === 'difficulty' && d.classes.map((c) => (
+          <p key={c.cls} className="text-fg-secondary">
+            {c.cls}-class elements: {youOrThem} {c.judge}, SR {c.senior}
+          </p>
+        ))}
+        {section === 'combination' && d.notMet.map((item) => (
+          <p key={`n${item.id}`} className="text-fg-secondary">
+            <span className="font-bold" style={{ color: FG.danger }}>Not met</span> by {youOrThem} (SR: met) — {item.rule}
+            {item.penalty ? ` (−${Number(item.penalty).toFixed(2)})` : ''}
+          </p>
+        ))}
+        {section === 'combination' && d.met.map((item) => (
+          <p key={`m${item.id}`} className="text-fg-secondary">
+            <span className="font-bold" style={{ color: FG.danger }}>Met</span> by {youOrThem} (SR: not met) — {item.rule}
+          </p>
+        ))}
+        {!d.detailed && (
+          <p className="text-fg-muted">Element counts and checklist ticks are not available for this slip — totals only.</p>
+        )}
+      </div>
+    );
+  };
+  const offJudges = (section) => PANEL_TYPES.filter(
+    (jt) => jt !== 'Senior Judge' && panelScores?.[jt] && panelMismatch.judgeMismatchDetails?.[jt]?.[section]
+  );
+  const red = 'rgb(var(--danger-fg))';
+  // Always list judges as Senior Judge, Judge 1, Judge 2, … regardless of the
+  // order their slips happened to arrive in.
+  const orderedEntries = PANEL_TYPES
+    .filter((jt) => panelScores?.[jt])
+    .map((jt) => [jt, panelScores[jt]]);
+  // Highlighted as "off", per section: a judge is red under Difficulty only
+  // when THEIR difficulty differs from the chief's, and under Combination only
+  // when their combination does. SR 2.40 / J1 2.40 / J2 3.20 → only J2 is red.
+  // A judge who only sits outside tolerance recorded the same routine and does
+  // not belong in this dialog — they are named in the tolerance one.
+  const isOff = (jt, section) => !!panelMismatch.judgeMismatchDetails?.[jt]?.[section];
+  const myMismatch = myJudgeType ? panelMismatch.judgeMismatchDetails?.[myJudgeType] : null;
+  // Senior Judge sees every category any judge disagrees on (their job is to
+  // resolve the whole panel); a non-Senior judge only sees the category(ies)
+  // their own slip actually diverges from the Senior's.
+  const showCombinationMismatch = isSeniorJudge ? panelMismatch.combinationMismatch : !!myMismatch?.combination;
+  const showDifficultyMismatch = isSeniorJudge ? panelMismatch.difficultyMismatch : !!myMismatch?.difficulty;
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <div className="modal-overlay z-[9998]" style={{ background: 'var(--scrim)', backdropFilter: 'blur(8px)' }} onClick={onClose}>
+            <BodyScrollLock />
+          <div className="w-full max-w-lg rounded-2xl border overflow-hidden modal-panel" style={{ background: 'rgb(var(--surface))', borderColor: 'rgb(var(--danger-fg) / 0.4)' }} onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div
+              className="flex items-center justify-between px-5 py-4 border-b"
+              style={{ background: 'rgb(var(--danger-fg) / 0.08)', borderColor: 'rgb(var(--danger-fg) / 0.2)' }}
+            >
+              <div className="flex items-center gap-3">
+                <div
+                  className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+                  style={{ background: 'rgb(var(--danger-fg) / 0.15)', border: '1px solid rgb(var(--danger-fg) / 0.3)' }}
+                >
+                  <AlertTriangle className="w-5 h-5 text-danger-fg"/>
+                </div>
+                <div>
+                  <p className="text-ink font-black text-base">Score Mismatch Detected</p>
+                  <p className="text-xs mt-0.5 text-fg-muted">
+                    {isSeniorJudge ? 'Panel review required (Senior Judge)' : 'Your score may need correction'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={onClose}
+                aria-label="Close"
+                className="w-8 h-8 tap-safe rounded-lg flex items-center justify-center hover:bg-ink/5 transition-colors text-fg-muted"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="p-5 space-y-3 max-h-[65vh] overflow-y-auto">
+              {showCombinationMismatch && (
+                <div
+                  className="rounded-xl border p-4"
+                  style={{ background: 'rgb(var(--danger-fg) / 0.07)', borderColor: 'rgb(var(--danger-fg) / 0.25)' }}
+                >
+                  <p className="text-sm font-bold text-ink mb-1">⛔ Combination Mismatch</p>
+                  <p className="text-xs text-fg-muted">
+                    {panelMismatch.combinationSelectionMismatch
+                      ? 'Checklist selections differ between judges. The exact items checked must match across all judges.'
+                      : `Totals: ${panelMismatch.combinationValues.map(v => Number(v).toFixed(2)).join(', ')}`}
+                  </p>
+                  {isSeniorJudge
+                    ? offJudges('combination').map((jt) => <DiffDetails key={jt} jt={jt} section="combination" />)
+                    : myJudgeType && <DiffDetails jt={myJudgeType} section="combination" />}
+                  {isSeniorJudge && panelMismatch.combinationValues.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {orderedEntries.map(([jt, data]) => (
+                        <span
+                          key={jt}
+                          className="text-xs px-2 py-1 rounded-lg"
+                          style={isOff(jt, 'combination')
+                            ? { background: 'rgb(var(--danger-fg) / 0.15)', color: FG.danger }
+                            : { background: 'rgb(var(--ink) / 0.06)', color: 'rgb(var(--ink) / 0.7)' }}
+                        >
+                          {jt === 'Senior Judge' ? 'SR' : jt.replace('Judge ', 'J')}
+                          {judgeNameMap?.[jt] ? ` · ${judgeNameMap[jt]}` : ''}: {Number(data.breakdown?.combination?.total ?? 0).toFixed(2)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {showDifficultyMismatch && (
+                <div
+                  className="rounded-xl border p-4"
+                  style={{ background: 'rgb(var(--danger-fg) / 0.07)', borderColor: 'rgb(var(--danger-fg) / 0.25)' }}
+                >
+                  <p className="text-sm font-bold text-ink mb-1">⛔ Difficulty Mismatch</p>
+                  <p className="text-xs text-fg-muted">
+                    {`Totals: ${panelMismatch.difficultyValues.map(v => Number(v).toFixed(2)).join(', ')}`}
+                  </p>
+                  {isSeniorJudge
+                    ? offJudges('difficulty').map((jt) => <DiffDetails key={jt} jt={jt} section="difficulty" />)
+                    : myJudgeType && <DiffDetails jt={myJudgeType} section="difficulty" />}
+                  {isSeniorJudge && (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {orderedEntries.map(([jt, data]) => (
+                        <span
+                          key={jt}
+                          className="text-xs px-2 py-1 rounded-lg"
+                          style={isOff(jt, 'difficulty')
+                            ? { background: 'rgb(var(--danger-fg) / 0.15)', color: FG.danger }
+                            : { background: 'rgb(var(--ink) / 0.06)', color: 'rgb(var(--ink) / 0.7)' }}
+                        >
+                          {jt === 'Senior Judge' ? 'SR' : jt.replace('Judge ', 'J')}
+                          {judgeNameMap?.[jt] ? ` · ${judgeNameMap[jt]}` : ''}:{' '}
+                          {Number(data.breakdown?.difficulty?.total ?? 0).toFixed(2)}
+                          {data.breakdown?.detailed !== false &&
+                            ` (A${data.breakdown?.difficulty?.aClass ?? 0}/B${data.breakdown?.difficulty?.bClass ?? 0}/C${data.breakdown?.difficulty?.cClass ?? 0})`}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!isSeniorJudge && (
+                <div
+                  className="rounded-xl border p-3 text-xs"
+                  style={{ background: 'rgb(var(--ink) / 0.03)', borderColor: 'rgb(var(--ink) / 0.08)', color: 'var(--fg-muted)' }}
+                >
+                  The Senior Judge&apos;s slip is the reference. Re-check your marks against it, or contact the Senior Judge to resolve this before final submission.
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-4 border-t border-line">
+              <button onClick={onClose} className="w-full py-3 rounded-xl font-bold text-sm text-ink" style={{ background: 'rgb(var(--accent))' }}>
+                {/* The Senior Judge resolves a mismatch by calling the off judges
+                    over; everyone else just acknowledges it. */}
+                {isSeniorJudge ? 'Understood — Call Judges' : 'Understood — Dismiss'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+};
+
+// ─── Tolerance Modal ──────────────────────────────────────────────────────────
+//
+// COP §3.4: the execution average and the Senior Judge's mark must agree to
+// within the tolerance for that score band. When they do not, this dialog says
+// so (see JudgePanelReview.finalizePanelScore).
+//
+// Deliberately shaped like MismatchModal so the two read as the same kind of
+// alert, and coloured amber rather than red so a judge can tell which one they
+// are looking at without reading the heading.
+//
+// The Senior Judge may also close the panel as it stands: COP §3.4 scores a
+// breach on the base score, (execution average + Senior) ÷ 2. Once they tap
+// Understood, Panel Review's button reads "Final Submit with Base Score".
+//
+// `viewer="scorer"` is the Scorer sheet's copy of the same alert (user rule
+// 2026-11-07): it names the athlete, shows the panel totals (the Scorer sees
+// every mark on the sheet anyway) and says the Senior Judge resolves it.
+export const ToleranceModal = ({ isOpen, onClose, panelMismatch, panelScores, isSeniorJudge, myJudgeType, judgeNameMap, viewer, athleteName }) => {
+  if (!isOpen) return null;
+  const isScorer = viewer === 'scorer';
+  const amber = 'rgb(var(--warning-fg))';
+  const info = panelMismatch?.toleranceInfo || {};
+  const num = (v) => Number(v ?? 0).toFixed(2);
+  const orderedEntries = PANEL_TYPES
+    .filter((jt) => panelScores?.[jt])
+    .map((jt) => [jt, panelScores[jt]]);
+  // The judges whose own total differs from the Senior Judge's — the marks
+  // that could be moving the execution average away from the chief's.
+  const offJudges = panelMismatch?.toleranceOffJudges || [];
+  const myScore = myJudgeType ? panelScores?.[myJudgeType]?.score : null;
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <div className="modal-overlay z-[9998]" style={{ background: 'var(--scrim)', backdropFilter: 'blur(8px)' }} onClick={onClose}>
+            <BodyScrollLock />
+          <div className="w-full max-w-lg rounded-2xl border overflow-hidden modal-panel" style={{ background: 'rgb(var(--surface))', borderColor: 'rgb(var(--warning-fg) / 0.45)' }} onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div
+              className="flex items-center justify-between px-5 py-4 border-b"
+              style={{ background: 'rgb(var(--warning-fg) / 0.10)', borderColor: 'rgb(var(--warning-fg) / 0.25)' }}
+            >
+              <div className="flex items-center gap-3">
+                <div
+                  className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+                  style={{ background: 'rgb(var(--warning-fg) / 0.15)', border: '1px solid rgb(var(--warning-fg) / 0.35)' }}
+                >
+                  <AlertTriangle className="w-5 h-5 text-warning-fg"/>
+                </div>
+                <div>
+                  <p className="text-ink font-black text-base">Tolerance Limit Exceeded</p>
+                  <p className="text-xs mt-0.5 text-fg-muted">
+                    {isScorer
+                      ? `Tolerance hit${athleteName ? ` — ${athleteName}` : ''}`
+                      : isSeniorJudge ? 'Panel review required (Senior Judge)' : 'Your execution mark may need correction'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={onClose}
+                aria-label="Close"
+                className="w-8 h-8 tap-safe rounded-lg flex items-center justify-center hover:bg-ink/5 transition-colors text-fg-muted"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="p-5 space-y-3 max-h-[65vh] overflow-y-auto">
+              <div
+                className="rounded-xl border p-4"
+                style={{ background: 'rgb(var(--warning-fg) / 0.07)', borderColor: 'rgb(var(--warning-fg) / 0.3)' }}
+              >
+                <p className="text-sm font-bold mb-1 text-warning-fg">⚠️ Execution average is outside tolerance</p>
+                <p className="text-xs text-fg-muted">
+                  |Exec avg {num(info.executionAvg)} − Senior {num(info.seniorScore)}| = {num(info.difference)},
+                  {' '}which exceeds the ±{num(info.tolerance)} allowed at this score (COP §3.4).
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <span className="text-xs px-2 py-1 rounded-lg bg-success-tint text-success-fg">
+                    SR (reference): {num(info.seniorScore)}
+                  </span>
+                  <span className="text-xs px-2 py-1 rounded-lg"
+                    style={{ background: 'rgb(var(--warning-fg) / 0.18)', color: FG.warning }}>
+                    Execution average: {num(info.executionAvg)}
+                  </span>
+                  <span className="text-xs px-2 py-1 rounded-lg"
+                    style={{ background: 'rgb(var(--ink) / 0.06)', color: 'rgb(var(--ink) / 0.7)' }}>
+                    Allowed gap: ±{num(info.tolerance)}
+                  </span>
+                </div>
+              </div>
+
+              {/* Who is off the chief's mark. Senior-only, like every other
+                  cross-panel figure on this screen. */}
+              {(isSeniorJudge || isScorer) && orderedEntries.length > 0 && (
+                <div
+                  className="rounded-xl border p-4"
+                  style={{ background: 'rgb(var(--ink) / 0.02)', borderColor: 'rgb(var(--ink) / 0.08)' }}
+                >
+                  <p className="type-tag mb-2 text-fg-muted">
+                    Panel totals
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {orderedEntries.map(([jt, data]) => (
+                      <span
+                        key={jt}
+                        className="text-xs px-2 py-1 rounded-lg"
+                        style={offJudges.includes(jt)
+                          ? { background: 'rgb(var(--warning-fg) / 0.18)', color: FG.warning }
+                          : { background: 'rgb(var(--ink) / 0.06)', color: 'rgb(var(--ink) / 0.7)' }}
+                      >
+                        {jt === 'Senior Judge' ? 'SR' : jt.replace('Judge ', 'J')}
+                        {judgeNameMap?.[jt] ? ` · ${judgeNameMap[jt]}` : ''}: {Number(data.score).toFixed(2)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!isSeniorJudge && !isScorer && myJudgeType !== 'Senior Judge' && myScore != null && (
+                <div
+                  className="rounded-xl border p-4"
+                  style={{ background: 'rgb(var(--warning-fg) / 0.07)', borderColor: 'rgb(var(--warning-fg) / 0.25)' }}
+                >
+                  <p className="text-xs text-fg-muted">
+                    Your total ({Number(myScore).toFixed(2)}) may be contributing to this gap.
+                    Re-check your execution mark against the routine you saw.
+                  </p>
+                </div>
+              )}
+
+              <div
+                className="rounded-xl border p-3 text-xs"
+                style={{ background: 'rgb(var(--ink) / 0.03)', borderColor: 'rgb(var(--ink) / 0.08)', color: 'var(--fg-muted)' }}
+              >
+                {isScorer
+                  ? `The Senior Judge resolves this: a judge corrects their slip, or the panel is final-submitted on the base score ${num(info.baseScore)} — (execution average ${num(info.executionAvg)} + Senior ${num(info.seniorScore)}) ÷ 2. The sheet's Average already uses the base score.`
+                  : isSeniorJudge
+                  ? `Adjust a judge's slip with the pencil on their card, or have them resubmit. Or close the panel as it stands: COP §3.4 scores it on the base score ${num(info.baseScore)} — (execution average ${num(info.executionAvg)} + Senior ${num(info.seniorScore)}) ÷ 2. After Understood, the button below reads "Final Submit with Base Score".`
+                  : `The Senior Judge will resolve this or final submit on the base score. Re-check your marks, or contact the Senior Judge.`}
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-4 border-t border-line">
+              <button type="button" onClick={onClose} className="w-full py-3 rounded-xl font-bold text-sm text-ink" style={{ background: 'rgb(var(--warning-fill))' }}>
+                Understood — Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+};
+
+// ─── SR Judge Edit Modal ───────────────────────────────────────────────────────
+
+export const SrEditModal = ({ isOpen, onClose, onSave, editTarget, combinationChecklist, selectedApparatus, POINT_CEILINGS, resolveDifficultyValue, getDifficultyRequirement, computeCombinationTotal, selectedCompetitionType }) => {
+  const [editScores, setEditScores] = useState(null);
+
+  useEffect(() => {
+    if (isOpen && editTarget) {
+      const b = editTarget.breakdown || {};
+      setEditScores({
+        difficulty: {
+          aClass: b.difficulty?.aClass ?? 0,
+          bClass: b.difficulty?.bClass ?? 0,
+          cClass: b.difficulty?.cClass ?? 0,
+          total: b.difficulty?.total ?? 0,
+        },
+        combination: {
+          checked: { ...(combinationChecklist.reduce((acc, item) => ({ ...acc, [item.id]: false }), {})), ...(b.combination?.checked || {}) },
+          total: b.combination?.total ?? 0,
+        },
+        execution: b.execution ?? 0,
+        bonus: b.bonus ?? 0,
+      });
+    }
+  }, [isOpen, editTarget]);
+
+  if (!isOpen || !editTarget || !editScores) return null;
+
+  const req = getDifficultyRequirement(selectedCompetitionType);
+  const editDiff = editScores.difficulty || {};
+  const editResolved = resolveDifficultyValue({ A: editDiff.aClass, B: editDiff.bClass, C: editDiff.cClass }, req);
+  const editMax = difficultyClassMax(req);
+
+  const handleDiff = (cls, val) => {
+    const n = parseInt(val) || 0;
+    const d = { ...editScores.difficulty, [cls]: n };
+    const resolved = resolveDifficultyValue({ A: d.aClass, B: d.bClass, C: d.cClass }, req);
+    d.total = Math.min(resolved.total, POINT_CEILINGS.difficulty);
+    setEditScores({ ...editScores, difficulty: d });
+  };
+
+  const handleComb = (itemId) => {
+    const checked = { ...editScores.combination.checked, [itemId]: !editScores.combination.checked[itemId] };
+    const total = computeCombinationTotal(selectedApparatus, checked);
+    setEditScores({ ...editScores, combination: { checked, total } });
+  };
+
+  const calcTotal = () => (
+    editScores.difficulty.total + editScores.combination.total +
+    parseFloat(editScores.execution || 0) + parseFloat(editScores.bonus || 0)
+  ).toFixed(2);
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <div className="modal-overlay z-[9997]" style={{ background: 'var(--scrim)', backdropFilter: 'blur(10px)' }} onClick={onClose}>
+            <BodyScrollLock />
+          <div className="w-full max-w-xl rounded-2xl border overflow-hidden modal-panel" style={{ background: 'rgb(var(--surface))', borderColor: 'rgb(var(--accent) / 0.4)', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div
+              className="flex items-center justify-between px-5 py-4 border-b flex-shrink-0"
+              style={{ background: 'rgb(var(--accent) / 0.10)', borderColor: 'rgb(var(--accent) / 0.2)' }}
+            >
+              <div>
+                <p className="text-ink font-black text-base">Edit Score — {editTarget.judgeType}</p>
+                <p className="text-xs mt-0.5" style={{ color: 'rgb(var(--accent-fg) / 0.7)' }}>Senior Judge override</p>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="text-right">
+                  <p className="text-xs text-fg-muted">Total</p>
+                  <p className="text-2xl font-black text-fg-secondary">{calcTotal()}</p>
+                </div>
+                <button
+                  onClick={onClose}
+                  aria-label="Close"
+                  className="w-8 h-8 tap-safe rounded-lg flex items-center justify-center hover:bg-ink/5 text-fg-muted"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Scrollable body */}
+            <div className="overflow-y-auto flex-1 p-3 sm:p-5 space-y-4">
+              {/* Difficulty */}
+              <div className="rounded-xl border p-3 sm:p-4 space-y-3 bg-surface-sunken border-line">
+                <div className="flex items-center justify-between">
+                  <h4 className="font-bold text-ink text-sm">Difficulty</h4>
+                  <span className="text-lg font-black text-warning-fg">{editScores.difficulty.total.toFixed(2)} / 3.80</span>
+                </div>
+                {DIFFICULTY_CLASSES.map(([key, cls, value]) => (
+                  <DifficultyPicker key={key} cls={cls} value={value} count={editScores.difficulty[key]}
+                    points={editResolved[cls]} max={editMax[cls]}
+                    onChange={(v) => handleDiff(key, v)} compact />
+                ))}
+              </div>
+
+              {/* Combination */}
+              <div className="rounded-xl border p-4 space-y-2 bg-surface-sunken border-line">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-bold text-ink text-sm">Combination</h4>
+                  <span className="text-lg font-black text-fg-secondary">{editScores.combination.total.toFixed(2)} / 1.60</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {combinationChecklist.map(item => {
+                    const checked = editScores.combination.checked[item.id];
+                    return (
+                      <label key={item.id}
+                        className="flex items-center gap-2 p-2.5 rounded-lg border cursor-pointer"
+                        style={{ background: checked ? 'rgb(var(--success-fg) / 0.08)' : 'rgb(var(--ink) / 0.03)', borderColor: checked ? 'rgb(var(--success-fg) / 0.3)' : 'rgb(var(--ink) / 0.07)' }}
+                      >
+                        <div className="w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0"
+                          style={{ borderColor: checked ? 'rgb(var(--success-fill))' : 'rgb(var(--ink) / 0.2)', background: checked ? 'rgb(var(--success-fill))' : 'transparent' }}>
+                          {checked && <CheckCircle className="w-3 h-3 text-ink" />}
+                        </div>
+                        <input type="checkbox" checked={checked} onChange={() => handleComb(item.id)} className="sr-only" />
+                        <span className="text-xs" style={{ color: checked ? FG.ink : 'rgb(var(--ink) / 0.5)' }}>{item.rule}</span>
+                        {!checked && <span className="ml-auto text-xs font-bold text-fg-muted">{item.penalty.toFixed(2)}</span>}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Execution */}
+              <div className="rounded-xl border p-4 bg-surface-sunken border-line">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-bold text-ink text-sm">Execution</h4>
+                  <span className="text-xs px-2 py-1 rounded-full bg-surface-raised text-fg">Max 4.40</span>
+                </div>
+                <DecimalInput
+                  impliedDecimal
+                  value={editScores.execution}
+                  onValueChange={raw => setEditScores({ ...editScores, execution: roundExecution(raw) })}
+                  aria-label="Execution"
+                  className="w-full px-4 py-3 rounded-xl border text-2xl font-black text-center text-ink"
+                  style={{ background: 'rgb(var(--ink) / 0.04)', borderColor: 'rgb(var(--ink) / 0.08)' }}
+                />
+              </div>
+
+              {/* Originality */}
+              <div className="rounded-xl border p-4 bg-surface-sunken border-line">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-bold text-ink text-sm">Originality</h4>
+                  <span className="text-xs px-2 py-1 rounded-full bg-surface-raised text-fg">0.20</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {[['None', 0], ['+0.20', 0.20]].map(([label, val]) => {
+                    const active = Math.abs((editScores.bonus || 0) - val) < 1e-6;
+                    return (
+                      <button key={label} type="button"
+                        onClick={() => setEditScores({ ...editScores, bonus: val })}
+                        aria-pressed={active}
+                        className="py-3 rounded-xl border font-bold text-sm transition-all duration-200"
+                        style={{ background: active ? 'rgb(var(--accent) / 0.15)' : 'rgb(var(--ink) / 0.03)', borderColor: active ? 'rgb(var(--accent))' : 'rgb(var(--ink) / 0.08)', color: active ? FG.ink : 'rgb(var(--ink) / 0.5)' }}
+                      >{label}</button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-4 border-t flex gap-3 flex-shrink-0 border-line">
+              <button onClick={onClose}
+                className="flex-1 py-3 rounded-xl font-bold text-sm border transition-all hover:bg-ink/5"
+                style={{ borderColor: 'rgb(var(--ink) / 0.1)', color: 'var(--fg-muted)' }}
+              >Cancel</button>
+              {/* Same Execution floor as the judge slip: reads disabled below
+                  0.10, and a tap only shows the popup. */}
+              <button
+                onClick={() => {
+                  if (!isExecutionEntered(editScores.execution)) {
+                    toast.error(EXECUTION_TOO_LOW_MESSAGE, { id: 'execution-too-low' });
+                    return;
+                  }
+                  onSave(editTarget.judgeType, editScores, calcTotal());
+                }}
+                aria-disabled={!isExecutionEntered(editScores.execution) || undefined}
+                className="flex-1 py-3 rounded-xl font-bold text-sm text-ink flex items-center justify-center gap-2"
+                style={{
+                  background: 'rgb(var(--success-fill))',
+                  opacity: isExecutionEntered(editScores.execution) ? 1 : 0.5,
+                  cursor: isExecutionEntered(editScores.execution) ? undefined : 'not-allowed',
+                }}>
+                <Save className="w-4 h-4" /> Save Override
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+};
+
+
+
+/** Working screens carry no ambient decoration (plan §5.7): kept as a no-op so callers need not change. */
+export const JudgeAmbience = () => null;
+
+/** The live connection, as text with a status colour (never colour alone). */
+export const LiveDot = ({ connected, compact = false }) => (
+  <span className={`ui-tag ui-status type-tag ${connected ? 'ui-status--success' : 'ui-status--danger'} ${connected ? 'live-dot--on' : ''}`}
+    aria-label={compact ? (connected ? 'Live' : 'Offline') : undefined}>
+    {!compact && (connected ? 'Live' : 'Offline')}
+  </span>
+);
+
+/* -------------------------------------------------------------------------- */
+/* Prop contracts (LOW-W2)                                                    */
+/*                                                                            */
+/* These components pass nested `breakdown` objects between the slip form,     */
+/* Panel Review and the two modals with no contract. Declaring it is worth     */
+/* more here than anywhere else in the app: the numbers become a competitor's  */
+/* persisted score, and a missing `combination.total` renders as 0.00 rather   */
+/* than throwing. The canonical shape is what normalizeBreakdown produces.     */
+/* -------------------------------------------------------------------------- */
+
+MismatchModal.propTypes = {
+  isOpen: PropTypes.bool,
+  onClose: PropTypes.func.isRequired,
+  panelMismatch: PropTypes.object,
+  panelScores: panelScoresShape,
+  isSeniorJudge: PropTypes.bool,
+  myJudgeType: PropTypes.string,
+  judgeNameMap: PropTypes.objectOf(PropTypes.string),
+};
+
+ToleranceModal.propTypes = {
+  isOpen: PropTypes.bool,
+  onClose: PropTypes.func.isRequired,
+  panelMismatch: PropTypes.object,
+  panelScores: panelScoresShape,
+  isSeniorJudge: PropTypes.bool,
+  myJudgeType: PropTypes.string,
+  judgeNameMap: PropTypes.objectOf(PropTypes.string),
+};
+
+SrEditModal.propTypes = {
+  isOpen: PropTypes.bool,
+  onClose: PropTypes.func.isRequired,
+  onSave: PropTypes.func.isRequired,
+  editTarget: editTargetShape,
+  combinationChecklist: combinationChecklistShape,
+  selectedApparatus: PropTypes.string,
+  pointCeilings: pointCeilingsShape,
+  // Passed in rather than imported so the modal stays presentational.
+  POINT_CEILINGS: pointCeilingsShape,
+  resolveDifficultyValue: PropTypes.func,
+  getDifficultyRequirement: PropTypes.func,
+  computeCombinationTotal: PropTypes.func,
+  selectedCompetitionType: PropTypes.string,
+};
+
+LiveDot.propTypes = {
+  connected: PropTypes.bool,
+  compact: PropTypes.bool,
+};
+/**
+ * Log out, as every judge header draws it: icon-only for the phone header, labelled ("Logout" from sm up)
+ * elsewhere. Six hand copies before this; the labelled one in the slip and panel review was 36px on a touch
+ * screen from 640 to 1023 — tap-safe now, like the rest.
+ */
+export const JudgeLogoutButton = ({ onLogout, compact = false }) => (
+  <button onClick={onLogout} type="button"
+    className={compact ? 'ui-btn ui-btn--line ui-icon-btn' : 'ui-btn ui-btn--line ui-btn--sm'}
+    aria-label="Logout">
+    <span className="ui-btn__label" style={{ display: 'contents' }}>
+      <LogOut aria-hidden="true" />
+      {!compact && <span className="hidden sm:inline">Logout</span>}
+    </span>
+  </button>
+);
+
+JudgeLogoutButton.propTypes = { onLogout: PropTypes.func.isRequired, compact: PropTypes.bool };
+
+/**
+ * The masthead every judge screen carries (design-language PLAN §7, the
+ * working-screen shell): the pole mark, the role ident, who is judging (or the
+ * screen's name) with the seat under it, an optional context block — the
+ * athlete being scored — and the actions: the live status, the screen's own
+ * buttons, Light/Dark, Logout. On phones the context wraps to a second row,
+ * as it always has.
+ *
+ * The ref reaches the <header>: the slip measures it to pin its score bar
+ * under it. Every control keeps the accessible name it had ("Back to team",
+ * "Your profile", "Logout"…); the mark is decoration, not a link, so nothing
+ * new can take a judge off a half-filled slip.
+ */
+export const JudgeHeader = forwardRef(function JudgeHeader(
+  { back = null, title, subtitle = null, context = null, live = null, status = null, actions = null, onLogout = null, wide = false },
+  ref,
+) {
+  return (
+    <header ref={ref} className={`shell-header judge-header${wide ? ' judge-header--wide' : ''}`}>
+      <div className="shell-header__bar judge-header__bar">
+        <div className="judge-header__who">
+          {back && (
+            <IconButton label={back.label} icon={ArrowLeft} variant="ghost" onClick={back.onClick} disabled={back.disabled} />
+          )}
+          <PoleMark className="judge-header__mark" />
+          <RoleIdent role="judge" className="judge-header__ident" />
+          <span className="judge-header__name">
+            <span className="judge-header__title">{title}</span>
+            {subtitle && <span className="judge-header__sub">{subtitle}</span>}
+          </span>
+        </div>
+        {context && <div className="judge-header__context">{context}</div>}
+        <div className="judge-header__actions">
+          {status}
+          {live !== null && <LiveDot connected={live} />}
+          {actions}
+          <AppearanceMenu />
+          {onLogout && <JudgeLogoutButton onLogout={onLogout} />}
+        </div>
+      </div>
+    </header>
+  );
+});
+
+JudgeHeader.propTypes = {
+  back: PropTypes.shape({ label: PropTypes.string.isRequired, onClick: PropTypes.func.isRequired, disabled: PropTypes.bool }),
+  title: PropTypes.node.isRequired,
+  subtitle: PropTypes.node,
+  context: PropTypes.node,
+  live: PropTypes.bool,
+  status: PropTypes.node,
+  actions: PropTypes.node,
+  onLogout: PropTypes.func,
+  wide: PropTypes.bool,
+};
+
+/** Whom the slip is for, in the header's context slot. */
+export const ScoringFor = ({ name, team }) => (
+  <div className="judge-scoring-for">
+    <span className="type-tag judge-scoring-for__tag">Scoring</span>
+    <span className="min-w-0 grid">
+      <span className="judge-scoring-for__name">{name}</span>
+      {team && <span className="judge-scoring-for__team">{team}</span>}
+    </span>
+  </div>
+);
+ScoringFor.propTypes = { name: PropTypes.node, team: PropTypes.node };

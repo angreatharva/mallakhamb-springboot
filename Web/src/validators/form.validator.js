@@ -1,0 +1,181 @@
+import { z } from 'zod';
+
+// ─── Validation Helper Functions ────────────────────────────────────────────
+
+/**
+ * Validate email format
+ * @param {string} email - Email address to validate
+ * @returns {boolean} True if valid email format
+ */
+export const validateEmailFormat = (email) => {
+  if (!email || typeof email !== 'string') return false;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email.trim());
+};
+
+/**
+ * Validate password strength
+ * @param {string} password - Password to validate
+ * @returns {object} { isValid: boolean, errors: string[] }
+ */
+export const validatePasswordStrength = (password) => {
+  const errors = [];
+  
+  if (!password || password.length < 8) {
+    errors.push('Password must be at least 8 characters');
+  }
+  if (password && password.length > 128) {
+    errors.push('Password is too long');
+  }
+  if (password && !/[a-z]/.test(password)) {
+    errors.push('Password must contain a lowercase letter');
+  }
+  if (password && !/[A-Z]/.test(password)) {
+    errors.push('Password must contain an uppercase letter');
+  }
+  if (password && !/[0-9]/.test(password)) {
+    errors.push('Password must contain a number');
+  }
+  
+  return {
+    isValid: errors.length === 0,
+    errors,
+  };
+};
+
+/**
+ * Validate phone number format (10 digits)
+ * @param {string} phone - Phone number to validate
+ * @returns {boolean} True if valid phone format
+ */
+export const validatePhoneFormat = (phone) => {
+  if (!phone || typeof phone !== 'string') return false;
+  const phoneRegex = /^[0-9]{10}$/;
+  return phoneRegex.test(phone.replace(/\s/g, ''));
+};
+
+// ─── Zod Validation Schemas ─────────────────────────────────────────────────
+
+// Common validation schemas
+export const emailSchema = z.string()
+  .min(1, 'Email is required')
+  .email('Invalid email address')
+  .max(255, 'Email is too long');
+
+export const passwordSchema = z.string()
+  .min(8, 'Password must be at least 8 characters')
+  .max(128, 'Password is too long');
+
+export const nameSchema = z.string()
+  .min(1, 'Name is required')
+  .max(100, 'Name is too long')
+  .regex(/^[a-zA-Z\s'-]+$/, 'Name contains invalid characters');
+
+export const phoneSchema = z.string()
+  .regex(/^[0-9]{10}$/, 'Phone number must be 10 digits');
+
+// Login validation schemas
+export const loginSchema = z.object({
+  email: emailSchema,
+  password: passwordSchema,
+});
+
+/** A Player ID as the server issues it: `firstname.lastname.ddmmyy`, maybe `.2`. */
+export const LOGIN_ID_PATTERN = /^[a-z0-9]+(\.[a-z0-9]+){1,3}$/;
+
+/**
+ * Rule for a field that takes an email or a Player ID (player sign-in and the
+ * player's password reset). Returns true or the message to show, so it plugs
+ * straight into react-hook-form's `validate`. Mirrors the server's
+ * accountIdentifier().
+ */
+export const validateEmailOrPlayerId = (value) => {
+  const typed = String(value ?? '').trim().toLowerCase();
+  if (!typed) return 'Email or Player ID is required';
+  if (typed.includes('@')) return validateEmailFormat(typed) || 'Please enter a valid email address';
+  return LOGIN_ID_PATTERN.test(typed) || 'A Player ID looks like firstname.lastname.ddmmyy';
+};
+
+/**
+ * A player signs in with their own email or their Player ID. A guardian's
+ * email is never a login — it may belong to several children.
+ */
+export const playerLoginSchema = z.object({
+  identifier: z.string().trim().toLowerCase().superRefine((value, ctx) => {
+    const verdict = validateEmailOrPlayerId(value);
+    if (verdict !== true) ctx.addIssue({ code: z.ZodIssueCode.custom, message: verdict });
+  }),
+  password: passwordSchema,
+});
+
+/**
+ * Judges sign in with their own email address, like every other role. This
+ * asked for a `username` until judges got accounts of their own; the usernames
+ * it validated were generated from the panel slot and belonged to the meet,
+ * not to the person.
+ */
+export const judgeLoginSchema = z.object({
+  email: emailSchema,
+  password: passwordSchema,
+});
+
+// Registration validation schemas
+export const playerRegisterSchema = z.object({
+  firstName: nameSchema,
+  lastName: nameSchema,
+  email: emailSchema,
+  phone: phoneSchema,
+  password: passwordSchema,
+  confirmPassword: z.string(),
+  dateOfBirth: z.string().min(1, 'Date of birth is required'),
+  gender: z.enum(['male', 'female', 'other'], {
+    errorMap: () => ({ message: 'Please select a gender' }),
+  }),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ['confirmPassword'],
+});
+
+export const coachRegisterSchema = z.object({
+  // Coaches and judges are stored as two name halves, like players.
+  firstName: nameSchema,
+  lastName: nameSchema,
+  email: emailSchema,
+  phone: phoneSchema,
+  password: passwordSchema,
+  confirmPassword: z.string(),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ['confirmPassword'],
+});
+
+// Password reset schemas
+export const forgotPasswordSchema = z.object({
+  email: emailSchema,
+});
+
+export const resetPasswordSchema = z.object({
+  password: passwordSchema,
+  confirmPassword: z.string(),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ['confirmPassword'],
+});
+
+// Helper function to validate data
+export const validateData = (schema, data) => {
+  try {
+    const result = schema.safeParse(data);
+    if (!result.success) {
+      const errors = {};
+      result.error.errors.forEach((err) => {
+        const path = err.path.join('.');
+        errors[path] = err.message;
+      });
+      return { success: false, errors };
+    }
+    return { success: true, data: result.data };
+  } catch (error) {
+    return { success: false, errors: { _general: 'Validation failed' } };
+  }
+};

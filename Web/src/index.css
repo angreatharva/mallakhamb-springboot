@@ -1,0 +1,216 @@
+@import './styles/generated/looks.css';
+@import './components/ui/ui.css'; /* before Tailwind's layers: see that file */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * ── Tokens ───────────────────────────────────────────────────────────────────
+ *
+ * Every colour, font, radius, shadow, blur, easing and duration token is
+ * GENERATED into styles/generated/looks.css from the look packs in
+ * src/styles/looks/ (`npm run looks`; docs/design-language/PLAN.md §4). Three
+ * axes meet there: LOOK on `[data-look]`, APPEARANCE (dark | light) on
+ * `[data-appearance]` — set on <html> by public/appearance-init.js before
+ * first paint, and on any element that must stay one appearance (the stopwatch
+ * is a dark instrument in both) — and ROLE on `html[data-role]`.
+ *
+ * Colours are RGB channel triplets so Tailwind's `/50` modifiers still work:
+ * `rgb(var(--surface) / 0.8)`. Don't add a token here: add it to
+ * src/styles/looks/contract.js and to every pack.
+ */
+
+/*
+ * One frame without transitions while the appearance switches, so two hundred
+ * elements do not cross-fade at once (src/utils/ui/appearance.js adds the
+ * class for two animation frames). The one justified `!important`: it has to
+ * beat every component's own transition for exactly that long.
+ */
+.appearance-switching,
+.appearance-switching *,
+.appearance-switching *::before,
+.appearance-switching *::after {
+  transition: none !important;
+}
+
+:root {
+  font-family: var(--font-root);
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--fg-root);
+  background-color: rgb(var(--bg));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * `100dvh` after a `100vh` fallback: on phones `vh` is the height with the
+ * browser's toolbars retracted, so a full-height page ran under them. Old
+ * WebKit that lacks `dvh` keeps the first declaration.
+ */
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  line-height: 1.6;
+  /*
+   * Respect the notch/home-indicator on phones that report insets. Zero on
+   * every desktop browser, so the laptop layout is untouched.
+   */
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/*
+ * Long unbroken strings — an email, a competition slug, a pasted URL — are a
+ * leading cause of a phone-width page scrolling sideways, and they land in
+ * headings and table cells where no wrapper can help. Breaking words only as a
+ * last resort leaves normal prose alone.
+ */
+body {
+  overflow-wrap: break-word;
+}
+
+/*
+ * Scrollbars follow the appearance. They were a light-grey track and thumb
+ * (#f1f1f1 / #c1c1c1) on a near-black app — the one light surface left in the
+ * dark design.
+ */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/*
+ * Focus: one visible ring for every control (WCAG 2.4.7).
+ *
+ * This replaced a rule that took the outline off every input, select and
+ * textarea and put back a 3px glow at 10% opacity — close to invisible on
+ * #0a0a0a — and 35 `outline-none` classes that did the same to buttons and
+ * fields. Keyboard users had no way to see where they were.
+ *
+ * `:focus-visible`, not `:focus`: a mouse click on a button shows no ring; a
+ * text field shows one however it was focused, which is what browsers decide
+ * for fields and what people expect. The colour is the role accent, measured at
+ * 4.1:1 or better against every surface in both appearances (plan §14.4), and
+ * an outline — not a box-shadow — survives Windows High Contrast.
+ *
+ * It sits after `@tailwind utilities`, so a stray `outline-none` loses to it on
+ * equal specificity; a component that genuinely needs a different ring says so
+ * with a `focus-visible:` utility, which is more specific and wins.
+ */
+:focus-visible {
+  outline: var(--focus-width) solid var(--focus-ring);
+  outline-offset: var(--focus-offset);
+}
+
+/*
+ * Buttons animate the properties that actually change on hover and press.
+ * `transition: all` also animated layout properties, so a button whose padding
+ * or width changed (a label swap, a spinner appearing) was tweened through
+ * every intermediate layout.
+ */
+button {
+  transition-property: color, background-color, border-color, opacity, box-shadow, transform;
+  transition-duration: 0.2s;
+  transition-timing-function: ease-in-out;
+}
+
+
+button:active {
+  transform: translateY(0);
+}
+
+/* Loading animation */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Responsive design helpers */
+@media (max-width: 640px) {
+  .container {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
+
+/*
+ * How large the decorative background orbs draw. Read by AmbientOrbs.
+ *
+ * The sizes those pages author were picked against a desktop canvas; reused
+ * unchanged on a phone a single orb covers the whole screen, and the blur
+ * reads as fog over the content rather than as depth behind it. Kept in CSS so
+ * resizing costs no re-render — see the note in AmbientOrbs.jsx.
+ */
+:root {
+  --orb-scale: 1;
+}
+
+@media (max-width: 767px) {
+  :root {
+    --orb-scale: 0.55;
+  }
+}
+
+@media (min-width: 768px) and (max-width: 1023px) {
+  :root {
+    --orb-scale: 0.75;
+  }
+}
+
+/* Global responsive image styles */
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* Prevent images from causing horizontal overflow */
+img,
+video,
+canvas,
+svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.bg-dot-black\/\[0\.2\] {
+  background-image: radial-gradient(#000 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+.bg-dot-white\/\[0\.2\] {
+  background-image: radial-gradient(#fff 1px, transparent 1px);
+  background-size: 16px 16px;
+}

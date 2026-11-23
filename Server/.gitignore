@@ -1,0 +1,75 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Test coverage
+coverage/
+*.lcov
+
+# Environment and dependencies
+.env
+.env.production
+.env.mumbai
+node_modules/
+dist
+dist-ssr
+*.local
+
+# Old/legacy code (migrated)
+old_config/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+
+# Operational scripts.
+#
+# Everything in scripts/ is TRACKED. This block used to be the other way round —
+# a blanket `scripts/*` followed by 47 `!` negations — and the failure mode was
+# always the same one: a script landed on disk, was wired into package.json, and
+# was never added to the allow-list, so a fresh checkout got an npm script with
+# no file behind it. It fails as "Cannot find module", long after the reason is
+# visible. setupApi.js, setupUi.js, seedApi.js and startup.js each had to be
+# rescued from it by hand; payWithDiscount.js — which `npm run setup` and
+# `npm run setup:api` both call — was found missing from HEAD the same way.
+#
+# Ignoring by exception is the only shape that does not depend on someone
+# remembering. Adding a script now needs no edit here.
+#
+# GENERATED files are the exception, by naming convention: anything written by a
+# tool rather than by a person is called *.generated.json and is not committed,
+# because it is reproduced in seconds from a live system and a stale copy would
+# be believed rather than questioned.
+#
+#   scripts/perf/routes.generated.json         read off the live Express router
+#                                              by scripts/perf/extract-routes.js
+#   scripts/seed/registrations.generated.json  holds plaintext passwords and
+#                                              describes one database's state;
+#                                              regenerate it with
+#                                              `npm --prefix Web run seed:ui`
+#
+# scripts/seed/panel-plan.json, meets.json and judges.json are NOT generated in
+# this sense. They are DECISIONS about what the fixture is — hand-maintained and
+# read by both stacks — so they stay tracked. A panel plan that existed only on
+# the machine that drew it would let a second machine seat a 4-judge panel and
+# score it as a 5, which produces a believable number rather than an error.
+*.generated.json
+
+# The demo seed (scripts/seedDemo.js): the drawn plan and the cheat sheet of
+# demo logins. Reproduced from --seed in seconds; never committed.
+scripts/seed/demo/
+# Credentials for the demo targets (DEMO_MONGODB_URI etc.).
+.env.demo

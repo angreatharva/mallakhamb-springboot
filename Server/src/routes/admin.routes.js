@@ -1,0 +1,802 @@
+/**
+ * Admin Routes
+ * 
+ * Defines routes for admin operations:
+ * - Dashboard and statistics
+ * - Team management
+ * - Player management
+ * - Judge management
+ * - Score management
+ * - Age group management
+ * - Transaction management
+ * 
+ * Requirements: 14.1, 14.2, 14.3, 14.8
+ * 
+ * @module routes/admin.routes
+ */
+
+const express = require('express');
+const { body, param } = require('express-validator');
+const createAuthMiddleware = require('../middleware/auth.middleware');
+const { requireAdmin, requireSuperAdmin, requireAdminOrScorer } = require('../middleware/auth.middleware');
+const { validateCompetitionContext, requireCompetitionAccess } = require('../middleware/competition-context.middleware');
+const { createCompetitionLockGuard } = require('../middleware/competition-lock.middleware');
+const { handleValidationErrors } = require('../middleware/validation.middleware');
+const adminValidator = require('../validators/admin.validator');
+const scoringValidator = require('../validators/scoring.validator');
+const performanceOrderValidator = require('../validators/performance-order.validator');
+const tieBreakDrawValidator = require('../validators/tie-break-draw.validator');
+const { 
+  auditUserCreated, auditUserUpdated, auditCompetitionCreated, auditCompetitionUpdated, auditCompetitionDeleted,
+  auditScoreUpdated, auditUserDeleted, auditPaymentCompleted
+} = require('../middleware/audit.middleware');
+
+/**
+ * Initialize admin routes with dependencies from DI container
+ * 
+ * @param {Object} container - DI container
+ * @returns {Router} Express router
+ */
+function createAdminRoutes(container) {
+  const router = express.Router();
+  
+  // Get middleware from container
+  const authMiddleware = createAuthMiddleware(container);
+  const authorize = requireAdmin;
+  /*
+   * After 23:59 UTC on a meet's end date, every write below is refused — an
+   * admin's authority over a competition ends when the competition does. The
+   * super admin keeps theirs, on /api/superadmin. See
+   * `middleware/competition-lock.middleware`.
+   */
+  const requireUnlockedCompetition = createCompetitionLockGuard(container);
+
+  // Get controller from DI container
+  const adminController = container.resolve('adminController');
+  const performanceOrderController = container.resolve('performanceOrderController');
+  const tieBreakDrawController = container.resolve('tieBreakDrawController');
+
+  // ==================== Public Authentication Routes ====================
+
+  /**
+   * @route   POST /api/admin/register
+   * @desc    Register a new admin
+   * @access  Public
+   */
+  router.post('/register', authMiddleware, requireSuperAdmin, adminController.registerAdmin);
+
+  /**
+   * @route   POST /api/admin/login
+   * @desc    Login an admin
+   * @access  Public
+   */
+  router.post('/login', adminController.loginAdmin);
+
+  // ==================== Dashboard & Statistics ====================
+
+  /**
+   * @route   GET /api/admin/dashboard
+   * @desc    Get dashboard (alias for /dashboard/stats)
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/dashboard',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminController.getDashboardStats
+  );
+
+  /**
+   * @route   GET /api/admin/dashboard/stats
+   * @desc    Get dashboard statistics
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/dashboard/stats',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminController.getDashboardStats
+  );
+
+  /*
+   * GET /api/admin/dashboard/competition/:competitionId is gone.
+   *
+   * Its per-age-group `teamCount` and `playerCount` came from counting `Team`
+   * and `Player` by `{competition, ageGroup}` — fields neither schema has — so
+   * every count it ever returned was 0, at a cost of two unindexed collection
+   * scans per age group (26 queries for a 12-category meet).
+   *
+   * Retired rather than rewritten: nothing calls it. It appears nowhere in the
+   * Web client, in no test and in no script, and the counts it was meant to
+   * show overlap GET /api/admin/dashboard/stats, which works.
+   */
+
+  /**
+   * @route   GET /api/admin/system/health
+   * @desc    Get system health status
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/system/health',
+    authMiddleware,
+    authorize,
+    adminController.getSystemHealth
+  );
+
+  // ==================== Team Management ====================
+
+  /**
+   * @route   GET /api/admin/teams/submitted
+   * @desc    Get submitted teams
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/teams/submitted',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminController.getSubmittedTeams
+  );
+
+  /**
+   * @route   GET /api/admin/teams
+   * @desc    Get all teams with filters and pagination
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/teams',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getAllTeams(),
+    handleValidationErrors,
+    adminController.getAllTeams
+  );
+
+  /**
+   * @route   GET /api/admin/teams/:teamId
+   * @desc    Get team details
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/teams/:teamId',
+    authMiddleware,
+    authorize,
+    // The meet this team is read in: the signed-in meet, and a `?competition=`
+    // the caller names must be one they may act on too (security audit
+    // 2026-10-31, M9 — the query used to override the meet unchecked).
+    validateCompetitionContext,
+    requireCompetitionAccess({ query: 'competition' }),
+    adminValidator.getTeamDetails(),
+    handleValidationErrors,
+    adminController.getTeamDetails
+  );
+
+  /**
+   * @route   PUT /api/admin/teams/:teamId/approve
+   * @desc    Approve team
+   * @access  SuperAdmin
+   */
+  router.put(
+    '/teams/:teamId/approve',
+    authMiddleware,
+    // Super admin only (security audit 2026-10-31, M9): these act on a team or
+    // player by id with no meet in scope, so an admin of one meet could reach
+    // any athlete's record. The SPA does not call them.
+    requireSuperAdmin,
+    requireUnlockedCompetition(),
+    adminValidator.approveTeam(),
+    handleValidationErrors,
+    adminController.approveTeam
+  );
+
+  /**
+   * @route   PUT /api/admin/teams/:teamId/reject
+   * @desc    Reject team
+   * @access  SuperAdmin
+   */
+  router.put(
+    '/teams/:teamId/reject',
+    authMiddleware,
+    // Super admin only (security audit 2026-10-31, M9): these act on a team or
+    // player by id with no meet in scope, so an admin of one meet could reach
+    // any athlete's record. The SPA does not call them.
+    requireSuperAdmin,
+    requireUnlockedCompetition(),
+    adminValidator.rejectTeam(),
+    handleValidationErrors,
+    adminController.rejectTeam
+  );
+
+  // ==================== Player Management ====================
+
+  /**
+   * @route   GET /api/admin/players
+   * @desc    Get all players with filters and pagination
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/players',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getAllPlayers(),
+    handleValidationErrors,
+    adminController.getAllPlayers
+  );
+
+  /**
+   * @route   GET /api/admin/players/:playerId
+   * @desc    Get player details
+   * @access  SuperAdmin
+   */
+  router.get(
+    '/players/:playerId',
+    authMiddleware,
+    // Super admin only (security audit 2026-10-31, M9): these act on a team or
+    // player by id with no meet in scope, so an admin of one meet could reach
+    // any athlete's record. The SPA does not call them.
+    requireSuperAdmin,
+    adminValidator.getPlayerDetails(),
+    handleValidationErrors,
+    adminController.getPlayerDetails
+  );
+
+  /**
+   * @route   PUT /api/admin/players/:playerId/status
+   * @desc    Update player status
+   * @access  SuperAdmin
+   */
+  router.put(
+    '/players/:playerId/status',
+    authMiddleware,
+    // Super admin only (security audit 2026-10-31, M9): these act on a team or
+    // player by id with no meet in scope, so an admin of one meet could reach
+    // any athlete's record. The SPA does not call them.
+    requireSuperAdmin,
+    requireUnlockedCompetition(),
+    adminValidator.updatePlayerStatus(),
+    handleValidationErrors,
+    adminController.updatePlayerStatus
+  );
+
+  /**
+   * @route   PUT /api/admin/players/:playerId/team
+   * @desc    Assign player to team
+   * @access  SuperAdmin
+   */
+  router.put(
+    '/players/:playerId/team',
+    authMiddleware,
+    // Super admin only (security audit 2026-10-31, M9): these act on a team or
+    // player by id with no meet in scope, so an admin of one meet could reach
+    // any athlete's record. The SPA does not call them.
+    requireSuperAdmin,
+    requireUnlockedCompetition(),
+    adminValidator.assignPlayerToTeam(),
+    handleValidationErrors,
+    adminController.assignPlayerToTeam
+  );
+
+  // ==================== Judge Management ====================
+
+  /**
+   * @route   POST /api/admin/judges/bulk
+   * @desc    Bulk save judges
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/judges/bulk',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.saveJudges(),
+    handleValidationErrors,
+    adminController.saveJudges
+  );
+
+  /**
+   * @route   GET /api/admin/judge-accounts
+   * @desc    Search registered judges to assign to a panel slot
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/judge-accounts',
+    authMiddleware,
+    authorize,
+    adminController.searchJudgeAccounts
+  );
+
+  /**
+   * @route   GET /api/admin/judges/summary
+   * @desc    Get all judges summary
+   * @access  Admin, SuperAdmin, Scorer
+   */
+  router.get(
+    '/judges/summary',
+    authMiddleware,
+    requireAdminOrScorer,
+    validateCompetitionContext,
+    adminController.getAllJudgesSummary
+  );
+
+  /**
+   * @route   GET /api/admin/judges
+   * @desc    Get all judges for competition
+   * @access  Admin, SuperAdmin, Scorer
+   */
+  router.get(
+    '/judges',
+    authMiddleware,
+    requireAdminOrScorer,
+    validateCompetitionContext,
+    adminController.getJudges
+  );
+
+  /**
+   * @route   POST /api/admin/judges
+   * @desc    Create single judge
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/judges',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.createSingleJudge(),
+    handleValidationErrors,
+    auditUserCreated,
+    adminController.createSingleJudge
+  );
+
+  /**
+   * @route   PUT /api/admin/judges/:judgeId
+   * @desc    Update judge
+   * @access  Admin, SuperAdmin
+   */
+  router.put(
+    '/judges/:judgeId',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.updateJudge(),
+    handleValidationErrors,
+    auditUserUpdated,
+    adminController.updateJudge
+  );
+
+  /**
+   * @route   DELETE /api/admin/judges/:judgeId
+   * @desc    Delete judge
+   * @access  Admin, SuperAdmin
+   */
+  router.delete(
+    '/judges/:judgeId',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.deleteJudge(),
+    handleValidationErrors,
+    auditUserDeleted,
+    adminController.deleteJudge
+  );
+
+  // ==================== Score Management ====================
+
+  /**
+   * @route   PUT /api/admin/scores/:scoreId/unlock
+   * @desc    Unlock a single score for editing
+   * @access  Admin, SuperAdmin
+   *
+   * This was registered as `/scores/unlock` with the `unlockScores()` body
+   * validator, which validates `ageGroup` — the shape of the AGE-GROUP unlock
+   * (`adminService.unlockScores` → `unlockScoresForAgeGroup`). But the handler
+   * it points at calls `adminService.unlockScore(req.params.scoreId, …)`, the
+   * SINGLE-score operation (`unlockScoreAsAdmin`). With no `:scoreId` segment
+   * in the path that argument was always `undefined`, so the route could never
+   * have unlocked anything.
+   *
+   * Corrected to the path the handler, the superadmin router
+   * (`super-admin.routes.js:45`) and the web client
+   * (`admin.api.js:24` → `PUT ${basePath}/scores/${scoreId}/unlock`) all already
+   * agree on. Nothing referenced the old path — not the client, not a test, not
+   * the docs — so there is no caller to keep working.
+   *
+   * The two operations stay separate on purpose: `unlockScoreAsAdmin` and
+   * `unlockScoresForAgeGroup` are genuinely different (single id vs whole age
+   * group, different return shapes). Do not merge them.
+   */
+  router.put(
+    '/scores/:scoreId/unlock',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    scoringValidator.getScoreById(),
+    handleValidationErrors,
+    auditScoreUpdated,
+    adminController.unlockScores
+  );
+
+  /**
+   * @route   PUT /api/admin/scores/:scoreId/players/:playerId/unlock
+   * @desc    Reopen ONE athlete (body: { apparatus }) for the judges: clears the
+   *          Senior Judge's Final Submit and that apparatus's Scorer lock, so
+   *          the panel can correct their slips. Marks are left as they are.
+   * @access  Admin (own meet only), SuperAdmin
+   */
+  router.put(
+    '/scores/:scoreId/players/:playerId/unlock',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    auditScoreUpdated,
+    adminController.unlockPlayerForJudges
+  );
+
+  /**
+   * @route   PUT /api/admin/scores/:scoreId/players/:playerId/restore-edits
+   * @desc    Restore the judges' Edit My Score allowance (3) on one athlete
+   *          (body: { apparatus, judgeType? }). No mark changes.
+   * @access  Admin (own meet only), SuperAdmin
+   */
+  router.put(
+    '/scores/:scoreId/players/:playerId/restore-edits',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    auditScoreUpdated,
+    adminController.restoreSlipEdits
+  );
+
+  /**
+   * @route   PUT /api/admin/scores/lock
+   * @desc    Lock scores
+   * @access  Admin, SuperAdmin
+   */
+  router.put(
+    '/scores/lock',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.lockScores(),
+    handleValidationErrors,
+    adminController.lockScores
+  );
+
+  /**
+   * @route   GET /api/admin/scores/team
+   * @desc    Get team scores
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/scores/team',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getTeamScores(),
+    handleValidationErrors,
+    adminController.getTeamScores
+  );
+
+  /**
+   * @route   GET /api/admin/scores/individual
+   * @desc    Get individual scores
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/scores/individual',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getIndividualScores(),
+    handleValidationErrors,
+    adminController.getIndividualScores
+  );
+
+  /**
+   * @route   POST /api/admin/scores/save
+   * @desc    Save scores for a team
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/scores/save',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminController.saveScores
+  );
+
+  /**
+   * @route   GET /api/admin/rankings/team
+   * @desc    Get team rankings
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/rankings/team',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getTeamRankings(),
+    handleValidationErrors,
+    adminController.getTeamRankings
+  );
+
+  /**
+   * @route   GET /api/admin/scores/team-rankings
+   * @desc    Get team rankings (alias for /rankings/team)
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/scores/team-rankings',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getTeamRankings(),
+    handleValidationErrors,
+    adminController.getTeamRankings
+  );
+
+  /**
+   * @route   GET /api/admin/rankings/individual
+   * @desc    Get individual rankings
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/rankings/individual',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getIndividualRankings(),
+    handleValidationErrors,
+    adminController.getIndividualRankings
+  );
+
+  /**
+   * @route   POST /api/admin/scores/recalculate
+   * @desc    Recalculate scores
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/scores/recalculate',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.recalculateScores(),
+    handleValidationErrors,
+    adminController.recalculateScores
+  );
+
+  // ==================== Running Order / Lots ====================
+  //
+  // Drawing lots is an ADMIN privilege — `authorize` here is requireAdmin,
+  // which admits admin and superadmin. The Senior Judge and Scorer reach the
+  // reorder endpoints through /api/judge instead, where a second check
+  // confirms they are on the panel they are reordering.
+
+  /**
+   * @route   GET /api/admin/lots
+   * @desc    Teams + athletes for a category in running order
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/lots',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    performanceOrderValidator.getOrder(),
+    handleValidationErrors,
+    performanceOrderController.getOrder
+  );
+
+  /**
+   * @route   POST /api/admin/lots/draw
+   * @desc    Draw lots for a category (random team order, optionally athletes)
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/lots/draw',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    performanceOrderValidator.drawLots(),
+    handleValidationErrors,
+    performanceOrderController.drawLots
+  );
+
+  /**
+   * @route   PUT /api/admin/lots/teams
+   * @desc    Set the team running order
+   * @access  Admin, SuperAdmin
+   */
+  router.put(
+    '/lots/teams',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    performanceOrderValidator.setTeamOrder(),
+    handleValidationErrors,
+    performanceOrderController.setTeamOrder
+  );
+
+  /**
+   * @route   PUT /api/admin/lots/players
+   * @desc    Set the athlete running order inside one team
+   * @access  Admin, SuperAdmin
+   */
+  router.put(
+    '/lots/players',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    performanceOrderValidator.setPlayerOrder(),
+    handleValidationErrors,
+    performanceOrderController.setPlayerOrder
+  );
+
+  // ==================== Lucky Draw (COP 1.12.4) ====================
+  // A tie the rules cannot break is settled by a physical draw at the venue;
+  // the admin records the order it produced and the ranking follows it.
+
+  /*
+   * Finals: who moved from Competition I into Competition II / III
+   * (docs/archive/qualification-plan.md). The engine fills them; admins see the lists,
+   * mark a withdrawal (the next in rank fills in) and record a Competition II
+   * draw. Admin and Super Admin, for the meet in context.
+   */
+  const finals = (name) => (req, res, next) => container.resolve('qualificationController')[name](req, res, next);
+  const finalWrite = [authMiddleware, authorize, validateCompetitionContext, requireUnlockedCompetition()];
+  const finalIdRule = param('finalId').isMongoId().withMessage('Invalid final');
+  router.get('/finals', authMiddleware, authorize, validateCompetitionContext, finals('list'));
+  router.post('/finals/recompute', ...finalWrite, finals('recompute'));
+  // Finalize: only then are the finalists entered (reopening is Super Admin only).
+  router.post('/finals/finalize-all', ...finalWrite, finals('finalizeAll'));
+  router.post('/finals/:finalId/finalize', ...finalWrite, finalIdRule, handleValidationErrors, finals('finalize'));
+  router.post('/finals/:finalId/withdraw', ...finalWrite, finalIdRule, body('playerId').isMongoId(),
+    body('reason').optional().isString().isLength({ max: 300 }), handleValidationErrors, finals('withdraw'));
+  router.post('/finals/:finalId/reinstate', ...finalWrite, finalIdRule, body('playerId').isMongoId(), handleValidationErrors, finals('reinstate'));
+  router.post('/finals/:finalId/draw', ...finalWrite, finalIdRule, body('ageGroup').isString(),
+    body('order').isArray({ min: 2, max: 20 }), body('order.*').isMongoId(), handleValidationErrors, finals('draw'));
+
+  /**
+   * @route   POST /api/admin/tie-break/draws
+   * @desc    Record the drawn order for one tied group of athletes
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/tie-break/draws',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    tieBreakDrawValidator.recordDraw(),
+    handleValidationErrors,
+    tieBreakDrawController.recordDraw
+  );
+
+  /**
+   * @route   DELETE /api/admin/tie-break/draws
+   * @desc    Remove a recorded draw (the group awaits a draw again)
+   * @access  Admin, SuperAdmin
+   */
+  router.delete(
+    '/tie-break/draws',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    tieBreakDrawValidator.clearDraw(),
+    handleValidationErrors,
+    tieBreakDrawController.clearDraw
+  );
+
+  // ==================== Age Group Management ====================
+
+  /**
+   * @route   POST /api/admin/age-groups/start
+   * @desc    Start age group competition type
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/age-groups/start',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.startAgeGroup(),
+    handleValidationErrors,
+    adminController.startAgeGroup
+  );
+
+  /**
+   * @route   POST /api/admin/age-groups/:ageGroup/end
+   * @desc    End age group
+   * @access  Admin, SuperAdmin
+   */
+  router.post(
+    '/age-groups/:ageGroup/end',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    requireUnlockedCompetition(),
+    adminValidator.endAgeGroup(),
+    handleValidationErrors,
+    adminController.endAgeGroup
+  );
+
+  /**
+   * @route   GET /api/admin/age-groups/status
+   * @desc    Get age group status
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/age-groups/status',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminController.getAgeGroupStatus
+  );
+
+  // ==================== Transaction Management ====================
+
+  /**
+   * @route   GET /api/admin/transactions/summary
+   * @desc    Get payment summary
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/transactions/summary',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminController.getPaymentSummary
+  );
+
+  /**
+   * @route   GET /api/admin/transactions
+   * @desc    Get transactions with filters and pagination
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/transactions',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getTransactions(),
+    handleValidationErrors,
+    adminController.getTransactions
+  );
+
+  /**
+   * @route   GET /api/admin/transactions/:transactionId
+   * @desc    Get transaction details
+   * @access  Admin, SuperAdmin
+   */
+  router.get(
+    '/transactions/:transactionId',
+    authMiddleware,
+    authorize,
+    validateCompetitionContext,
+    adminValidator.getTransactionDetails(),
+    handleValidationErrors,
+    adminController.getTransactionDetails
+  );
+
+  return router;
+}
+
+module.exports = createAdminRoutes;

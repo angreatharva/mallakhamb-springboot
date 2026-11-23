@@ -1,0 +1,465 @@
+// Load environment variables FIRST
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+
+/**
+ * Seat every panel the meet needs, from the frozen plan, through the admin API.
+ *
+ *   SEED_ADMIN_PASSWORD=... node scripts/seatPanels.js
+ *   SEED_ADMIN_PASSWORD=... node scripts/seatPanels.js --place=Mumbai --dry-run
+ *   SEED_ADMIN_PASSWORD=... node scripts/seatPanels.js --only=Male/Under10
+ *   SEED_ADMIN_PASSWORD=... node scripts/seatPanels.js --apparatus="Rope Mallakhamb"
+ *   SEED_ADMIN_PASSWORD=... node scripts/seatPanels.js --finals   # Competition II, after Finalize
+ *
+ * The sizes come from `scripts/seed/panel-plan.json`, drawn once by
+ * `planPanels.js`. Nothing here decides one — that separation is the point.
+ * This is the non-browser path; `Web/e2e/seat-panels.spec.js` does the same job
+ * through the admin screen, from the same plan.
+ *
+ * `seatPanel.js` seats ONE category from the command line and stays the right
+ * tool for repairing a single panel by hand.
+ *
+ * WHAT A "COMPETITION II PANEL" ACTUALLY IS — the thing worth reading twice.
+ *
+ * Since migration 017 (owner, 2026-11-14) it is its own seats. Judge's unique
+ * indexes are `{gender, ageGroup, apparatus, judgeNo|judgeType, competition,
+ * competitionTypes}`, so a slot holds one panel PER COMPETITION TYPE, and
+ * `saveJudges` matches an existing seat only within the same type. Each type is
+ * seated as its own pass with `competitionTypes: [type]`, as the Judges tab does.
+ *
+ * Competition II is not seated by the default run: the admin seats it once the
+ * finals are confirmed (Finals tab → Seat judges), so `--finals` seats it for
+ * each finalized Competition II final — the meet's own judges or a relief panel
+ * (lib/panel-plan#finalsPanelSeats) — and checks the slot's Competition I panel
+ * is untouched. (Before 017 there was one seat for every type, and seating
+ * Competition II replaced the Competition I judge.)
+ *
+ * Scores stay separate regardless: a Score document's identity is
+ * `{teamId, gender, ageGroup, competition, competitionType}`, so one panel
+ * judging both types writes two documents per team.
+ *
+ * APPARATUS IS THE OTHER AXIS, AND IT IS NOT LIKE COMPETITION TYPE.
+ *
+ * It IS in both unique keys, so Pole and Rope in one category are two separate
+ * panels — seated in full, one pass each, not merged into an array on one seat.
+ * That is what makes a category with three apparatus three times the seats.
+ *
+ * WHICH apparatus is not this script's decision and is not in the plan: it is
+ * read from the MEET's `apparatusConfig` for each competition type, so seeding
+ * follows whatever the competition was created to run. `--apparatus=` narrows
+ * it for a repair run.
+ *
+ * The plan's SIZE is per category and applies to every apparatus in it. A meet
+ * wanting Pole judged by three and Rope by five is legal — nothing here or in
+ * the schema forbids it — but it is not something to draw at random, so
+ * `seatPanel.js` is the tool for it.
+ *
+ * IDEMPOTENT, AND IT SHRINKS AS WELL AS GROWS. A seat the plan wants is
+ * created or updated in place; an evaluation seat the plan does NOT want — a
+ * Judge 4 left over from when this category was a 5 — is vacated. Seating
+ * alone would have made a re-plan a one-way ratchet upward, and a panel one
+ * seat too wide is not a visible failure: it scores by the wrong method and
+ * produces a believable number.
+ *
+ * Requires the API to be running, and an admin account (scripts/createAdmin.js).
+ */
+
+const {
+  SLOT_NO,
+  REQUIRED_SEATS,
+  call,
+  signInAsAdmin,
+  findCompetition,
+  resolveSeatAccounts,
+} = require('./lib/admin-api');
+const { readPlan, planForPlace, seatsFor, withTimeKeeper, finalsPanelSeats, panelsForType } = require('./lib/panel-plan');
+
+function parseArgs(argv) {
+  const value = (name) => {
+    const found = argv.find((a) => a.startsWith(`--${name}=`));
+    return found ? found.slice(name.length + 3) : undefined;
+  };
+  return {
+    place: value('place'),
+    only: value('only'), // e.g. --only=Male/Under10
+    apparatus: value('apparatus'), // e.g. --apparatus="Rope Mallakhamb"
+    dryRun: argv.includes('--dry-run'),
+    // Competition II is seated AFTER its finals are confirmed (owner, 2026-11-14):
+    // the default run seats every other competition, `--finals` seats Competition II.
+    finals: argv.includes('--finals'),
+  };
+}
+
+/** The age groups whose Competition II final is finalized (the admin's Finals tab). */
+async function finalizedAllRound(competition) {
+  const response = await call('/admin/finals', { competitionId: competition._id });
+  return new Set((response.data?.finals || [])
+    .filter((f) => f.competitionType === 'competition_2' && ['finalized', 'started'].includes(f.status) && (f.qualifiers || []).length)
+    .map((f) => `${f.gender}/${f.ageGroup}`));
+}
+
+/**
+ * The apparatus the meet runs for one competition type.
+ *
+ * Read from the competition rather than from the plan or a constant: a panel
+ * seated for an apparatus the meet does not run can never judge anybody, and a
+ * meet that runs one this script did not know about goes unstaffed.
+ *
+ * `apparatusConfig` arrives from the API as a plain object keyed by
+ * competition-type slug. A meet declaring none is a real state — a competition
+ * created before the field was filled in — and the seats it wants are the
+ * legacy category-wide ones, which `null` still means.
+ *
+ * @param {Object} competition
+ * @param {string} competitionType
+ * @param {string} [only] - `--apparatus=`, narrowing to one
+ * @returns {Array<string|null>} one entry per panel to seat
+ */
+function apparatusFor(competition, competitionType, only) {
+  const configured = competition.apparatusConfig?.[competitionType];
+  const list = Array.isArray(configured) ? configured.filter(Boolean) : [];
+
+  if (list.length === 0) return [null];
+
+  if (only) {
+    if (!list.includes(only)) {
+      throw new Error(
+        `--apparatus="${only}" is not run by this meet for ${competitionType}. ` +
+        `It runs: ${list.join(', ')}`
+      );
+    }
+    return [only];
+  }
+
+  return list;
+}
+
+/**
+ * Seats currently standing in the way of ONE panel.
+ *
+ * Asked without a competitionTypes filter on purpose: the question is "who is
+ * physically in this slot", and a seat carrying only `competition_1` is still
+ * occupying the slot a `competition_2` seating would collide with.
+ *
+ * Asked WITH an apparatus filter for the opposite reason. Apparatus is in the
+ * unique keys, so the Pole and Rope seats are different slots that do not
+ * collide, and folding them together would have this vacate one to make room
+ * for the other.
+ *
+ * A LIST, not a map keyed by seat name, because the server answers an apparatus
+ * filter with that apparatus's seats PLUS any legacy category-wide ones — so
+ * "Senior Judge" legitimately comes back twice while a meet is part-way through
+ * being re-seated, and a map would silently discard one of them.
+ *
+ * `null` apparatus means the meet declares none, so there is one panel per
+ * category and no filter to apply.
+ *
+ * @returns {Promise<Array<{id: string, judgeType: string, accountId: string, types: string[], apparatus: string|null}>>}
+ */
+async function seatedIn(competition, { gender, ageGroup }, apparatus = null) {
+  const query = new URLSearchParams({ gender, ageGroup, competition: competition._id });
+  if (apparatus) query.set('apparatus', apparatus);
+  const response = await call(`/admin/judges?${query}`, { competitionId: competition._id });
+  // `data` is the seat array itself, not an envelope around one.
+  const rows = response.data || [];
+
+  return rows
+    .filter((row) => row.judgeAccount) // an empty slot occupies nothing
+    .map((row) => ({
+      id: row._id,
+      judgeType: row.judgeType,
+      accountId: String(row.judgeAccount?._id || row.judgeAccount),
+      types: row.competitionTypes || [],
+      apparatus: row.apparatus || null,
+    }));
+}
+
+/**
+ * Empty a seat the plan no longer wants.
+ *
+ * The same call the admin screen's Remove button makes. It empties the slot
+ * rather than deleting the document — the slot is part of the panel's layout,
+ * and the next plan may want somebody back in it.
+ */
+const vacate = (judgeId, csrfToken, competitionId) =>
+  call(`/admin/judges/${judgeId}`, { method: 'DELETE', csrfToken, competitionId });
+
+/**
+ * Seat every panel at ONE meet.
+ *
+ * `apparatus` arrives as an option rather than being read from `process.argv`
+ * here: the run now walks every meet in the plan through this function, so the
+ * arguments are parsed once by the caller and the same narrowing applies to all
+ * of them.
+ *
+ * @param {Object} meetPlan - one entry from the plan's `meets`
+ * @param {Object} plan - the whole plan, for competitionTypes and provenance
+ * @param {string} csrfToken
+ * @param {{only: string|null, apparatus: string|null, dryRun: boolean}} options
+ * @returns {Promise<number>} how many panels failed
+ */
+async function seatMeet(meetPlan, plan, csrfToken, { only, apparatus: apparatusOnly, dryRun, finals }) {
+  for (const seat of REQUIRED_SEATS) {
+    if (!meetPlan.seats[seat]) {
+      throw new Error(`${meetPlan.place} is missing the required seat "${seat}"`);
+    }
+  }
+
+  const competition = await findCompetition(meetPlan.place);
+  // The MEET's competitions (I only, I+II, I+III or I+II+III), not the plan's.
+  const ownTypes = competition.competitionTypes?.length ? competition.competitionTypes : plan.competitionTypes;
+  // Competition II is seated after Finalize (`--finals`); everything else now.
+  const meetTypes = finals
+    ? ownTypes.filter((t) => t === 'competition_2')
+    : ownTypes.filter((t) => t !== 'competition_2');
+  if (meetTypes.length === 0) {
+    console.log(`\n🏆 ${competition.place}: ${finals ? 'no Competition II' : 'nothing but Competition II'} — nothing to seat`);
+    return 0;
+  }
+  const finalsPanel = finals ? finalsPanelSeats(plan, meetPlan.place) : null;
+  console.log(`\n🏆 ${competition.name} — ${competition.place} ${competition.year} [${meetPlan.level}]`
+    + `${finals ? ` · Competition II finals, ${finalsPanel.relief ? `relief panel (${finalsPanel.from}'s judges)` : 'the meet\'s own judges'}` : ''}`);
+
+  const seatHolders = withTimeKeeper(finals ? finalsPanel.seats : meetPlan.seats);
+  const accountId = await resolveSeatAccounts(seatHolders);
+  for (const [seat, email] of Object.entries(seatHolders)) {
+    console.log(`   ${seat.padEnd(13)} ${email}`);
+  }
+  console.log();
+
+  /*
+   * Each panel with the competition types it judges. Competition I and III
+   * are per age group; Competition II is ONE "All ages" final per gender
+   * (owner, 2026-11-17), so `--finals` seats an All-ages panel per gender —
+   * its own seats (competitionTypes is in the unique keys, migration 017), so
+   * it can be other people — once the admin has finalized that final.
+   */
+  const ready = finals ? await finalizedAllRound(competition) : null;
+  const all = (finals ? panelsForType(meetPlan, 'competition_2') : meetPlan.panels)
+    .filter((p) => !ready || ready.has(`${p.gender}/${p.ageGroup}`))
+    .map((p) => ({ ...p, types: meetTypes }));
+  const wanted = only
+    ? all.filter((p) => `${p.gender}/${p.ageGroup}` === only)
+    : all;
+  if (finals && wanted.length === 0) {
+    console.log(`   no finalized Competition II final at ${competition.place} — nothing to seat`);
+    return 0;
+  }
+  if (wanted.length === 0) throw new Error(`--only=${only} matched no panel in the plan`);
+  const ownHolders = finals ? await resolveSeatAccounts(withTimeKeeper(meetPlan.seats)) : null;
+
+  /*
+   * Which apparatus a panel is needed for, per competition type.
+   *
+   * Per type because a meet may run Competition I on Pole alone and
+   * Competition III on all three; the union is every panel to seat in a
+   * category, and each one is then widened only for the types that run it.
+   *
+   * A property of the MEET, not of the category, so it is resolved once.
+   */
+  const apparatusByType = new Map(
+    meetTypes.map((ct) => [ct, apparatusFor(competition, ct, apparatusOnly)])
+  );
+  const panelApparatus = [...new Set([...apparatusByType.values()].flat())];
+  console.log(
+    `🤸 Apparatus: ${panelApparatus.map((a) => a || '(none declared — one panel per category)').join(', ')}\n`
+  );
+
+  const summary = [];
+  let failed = 0;
+
+  for (const panel of wanted) {
+    const categoryLabel = `${panel.gender} ${panel.ageGroup}`;
+    const seats = seatsFor(panel.size);
+    const judges = seats.map((judgeType) => ({
+      judgeNo: SLOT_NO[judgeType],
+      judgeType,
+      judgeAccount: accountId[judgeType],
+    }));
+
+    const ownApparatus = [...new Set(panel.types.flatMap((t) => apparatusByType.get(t) || []))];
+    for (const apparatus of ownApparatus) {
+      // `null` is the meet-declares-none case: one panel for the whole
+      // category, which is what a seat with no apparatus has always meant.
+      const label = apparatus ? `${categoryLabel} · ${apparatus}` : categoryLabel;
+
+      if (dryRun) {
+        summary.push({ panel: label, seats: panel.size, result: 'dry-run' });
+        continue;
+      }
+
+      try {
+        // ── Vacate what the plan no longer wants, before seating ────────────
+        //
+        // First, because a shrink that ran afterwards could undo the seating it
+        // was supposed to follow, and because a person moved between seats needs
+        // their old one empty before the one-person-one-seat check will let them
+        // take the new one.
+        // Only the seats of the competitions being seated: a Competition I seat
+        // in the same slot is another panel since migration 017, never in the way.
+        const staffed = (await seatedIn(competition, panel, apparatus))
+          .filter((s) => s.types.length === 0 || s.types.some((t) => meetTypes.includes(t)));
+        let vacated = 0;
+        for (const seat of staffed) {
+          /*
+           * Two reasons to empty a seat, and the second is an upgrade path.
+           *
+           * 1. The plan no longer wants this role — a Judge 4 left over from
+           *    when the category was drawn as a 5.
+           * 2. It is a LEGACY category-wide seat (`apparatus: null`) and we are
+           *    seating a named panel over the top of it. It has to go BEFORE the
+           *    named seat is written, not after: it covers every apparatus, so
+           *    `assertNotAlreadyOnPanel` sees the same person already on this
+           *    panel and refuses the new seat outright. Left in place it would
+           *    also be a second row for one role, and the panel size is a count
+           *    of rows.
+           */
+          const supplanted = !!apparatus && !seat.apparatus;
+          if (seats.includes(seat.judgeType) && !supplanted) continue;
+          await vacate(seat.id, csrfToken, competition._id);
+          vacated += 1;
+          console.log(
+            `   − ${label}: vacated ${seat.judgeType}` +
+            `${supplanted ? ' (category-wide seat, superseded)' : ''}`
+          );
+        }
+
+        // ── Seat the plan, once per competition type ────────────────────────
+        //
+        // One pass per type: each writes that type's own seats (header: since
+        // migration 017 a slot holds one panel per competition type).
+        let created = 0;
+        let updated = 0;
+        for (const [competitionType, list] of apparatusByType) {
+          if (!panel.types.includes(competitionType) || !list.includes(apparatus)) continue;
+
+          // The admin routes run behind validateCompetitionContext, which reads
+          // the meet from the token, the X-Competition-Id header, or the body. An
+          // admin signing in through the UI picks one; a script has to say which.
+          const result = await call('/admin/judges/bulk', {
+            method: 'POST',
+            csrfToken,
+            competitionId: competition._id,
+            body: {
+              gender: panel.gender,
+              ageGroup: panel.ageGroup,
+              competitionTypes: [competitionType],
+              // The panel's own apparatus, from the meet's `apparatusConfig`.
+              // It is part of the seat's identity — Pole and Rope here are two
+              // panels, not one panel with two labels.
+              apparatus,
+              competition: competition._id,
+              judges,
+            },
+          });
+
+          const { created: made = [], updated: changed = [], errors = [] } = result.data || {};
+          if (errors.length > 0) {
+            console.error(`❌ ${label} · ${competitionType}`);
+            console.table(errors.map((e) => ({ seat: e.judge?.judgeType, error: e.error })));
+            throw new Error(`${errors.length} seat(s) refused`);
+          }
+          created += made.length;
+          updated += changed.length;
+        }
+
+        // Seating Competition II must leave the slot's Competition I panel as it
+        // was — before migration 017 it replaced those judges with the new ones.
+        if (finals) {
+          const after = await seatedIn(competition, panel, apparatus);
+          const ii = after.filter((s) => s.types.includes('competition_2'));
+          const wrongII = ii.filter((s) => s.accountId !== String(accountId[s.judgeType]));
+          if (ii.length !== seats.length || wrongII.length) throw new Error(`Competition II panel is ${ii.length} seat(s), ${wrongII.length} not the people seated`);
+          // Competition II is one "All ages" final per gender (2026-11-17), a
+          // category with no Competition I panel of its own: the Competition I
+          // panels it must leave alone are each age group's of that gender.
+          const iPanels = panel.ageGroup === 'AllAges'
+            ? meetPlan.panels.filter((p) => p.gender === panel.gender)
+            : [panel];
+          for (const iPanel of iPanels) {
+            const one = (await seatedIn(competition, iPanel, apparatus)).filter((s) => s.types.includes('competition_1'));
+            const movedI = one.filter((s) => s.accountId !== String(ownHolders[s.judgeType]));
+            const want = seatsFor(iPanel.size).length;
+            if (one.length !== want || movedI.length) throw new Error(`seating Competition II changed the ${iPanel.ageGroup} Competition I panel (${movedI.map((s) => s.judgeType).join(', ') || `${one.length} seats`})`);
+          }
+        }
+
+        summary.push({
+          panel: label,
+          seats: `${panel.size} + Scorer`,
+          result: `${created} created, ${updated} updated${vacated ? `, ${vacated} vacated` : ''}`,
+        });
+        console.log(`✅ ${label} — ${panel.size} eval + Scorer`);
+      } catch (error) {
+        failed += 1;
+        summary.push({ panel: label, seats: panel.size, result: `ERROR: ${error.message}` });
+        console.error(`❌ ${label} — ${error.message}`);
+      }
+    }
+  }
+
+  console.log(`\n📋 ${meetPlan.place} panels`);
+  console.table(summary);
+
+  // Counted per PANEL, not per category: one category running three apparatus
+  // is three panels of that size, and the totals should say so.
+  const bySize = wanted.reduce(
+    (acc, p) => ({ ...acc, [p.size]: (acc[p.size] || 0) + panelApparatus.length }),
+    {}
+  );
+  console.log(`Panel sizes: ${Object.entries(bySize).sort().map(([s, n]) => `${n}×${s}-judge`).join(', ')}`);
+
+  return failed;
+}
+
+/**
+ * Seat every planned meet, or just one with `--place=`.
+ *
+ * Signing in ONCE and reusing the token across all twelve: the admin routes
+ * take the meet from the X-Competition-Id header rather than from the token's
+ * claim, so one session seats them all. Signing in per meet would be twelve
+ * bcrypt compares for nothing.
+ *
+ * One meet failing does not stop the others. Twelve meets is long enough that
+ * aborting on the first failure would mean finding out about the second only
+ * after fixing the first — the exit code still reports it.
+ */
+async function seatAll() {
+  const { place, only, apparatus: apparatusOnly, dryRun, finals } = parseArgs(process.argv.slice(2));
+  const plan = readPlan();
+
+  const meets = place
+    ? [planForPlace(plan, place)]
+    : plan.meets;
+
+  const csrfToken = await signInAsAdmin('seatPanels.js');
+
+  console.log(`📋 Plan drawn ${plan.generatedAt} (seed ${plan.seed})`);
+  console.log(`   Seating ${meets.length} meet(s): ${meets.map((m) => m.place).join(', ')}`);
+
+  let failedPanels = 0;
+  const failedMeets = [];
+
+  for (const meetPlan of meets) {
+    try {
+      failedPanels += await seatMeet(meetPlan, plan, csrfToken, { only, apparatus: apparatusOnly, dryRun, finals });
+    } catch (error) {
+      failedMeets.push(meetPlan.place);
+      console.error(`❌ ${meetPlan.place} — ${error.message}`);
+    }
+  }
+
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Seated ${meets.length - failedMeets.length} of ${meets.length} meet(s)`);
+  if (failedMeets.length) console.log(`Failed: ${failedMeets.join(', ')}`);
+  if (failedPanels) console.log(`${failedPanels} individual panel(s) refused`);
+
+  if (failedPanels > 0 || failedMeets.length > 0) process.exit(1);
+
+  console.log('\nRecord it into the seed so it can be rebuilt elsewhere:');
+  console.log('  npm --prefix Server run seed:capture');
+}
+
+seatAll().catch((error) => {
+  console.error(`❌ ${error.message}`);
+  process.exit(1);
+});

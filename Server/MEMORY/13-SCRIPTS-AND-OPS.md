@@ -1,0 +1,195 @@
+---
+doc: 13-SCRIPTS-AND-OPS
+covers:
+  - scripts/**
+  - package.json
+read_when: "running or changing a seed/ops/perf script, or checking what an npm script actually does before running it"
+depends_on: [01-ARCHITECTURE, 04-DATA-MODEL]
+verified_against_commit: f5465b4
+last_verified: 2026-11-11
+---
+
+All 40 npm scripts map cleanly to an existing file (`scripts/*.js`,
+`server.js`, or `jest`) — no mismatches. `Server/README.md`'s own "Stale
+entries" callout claiming broken migrate aliases and phantom scripts is
+**itself stale** — see GOTCHAS.md.
+
+## Destructive / high-blast-radius — read before running
+
+| Script | npm script | Danger |
+|---|---|---|
+| `syncDatabase.js` | `db:sync` | **Highly destructive** with `--commit` — drops and replaces destination collections between configured dev/prod ends. Dry-run by default, double-confirms before writing to prod. |
+| `setupAll.js` (and the chain it drives) | `setup`, `setup:api`, `setup:ui` | Can **drop the whole database** with `--drop`. |
+| `resetScores.js` | `reset:scores` | Deletes `Score` documents for a meet/category. Dry-run by default; `--commit` required. |
+| `createCompetitions.js --force` | `create-competitions` | Rewrites dates/config on existing seeded meets (keeps entries). |
+| `seatPanels.js` | `seed:panels` | Idempotent but **vacates** seats the frozen plan no longer wants, across up to 15 meets. |
+
+## Bootstrapping / seeding
+
+| Script | npm script | What it does | Blast radius |
+|---|---|---|---|
+| `createAdmin.js` | `create-admin` | Idempotent dev admin creation | 1 DB doc |
+| `createSuperAdmin.js` | `create-superadmin` | Idempotent dev superadmin creation; reads `SEED_SUPERADMIN_EMAIL`/`SEED_SUPERADMIN_PASSWORD` like `seedApi` does (since 2026-10-16, so the nightly lifecycle run and the seed agree on one account) | 1 DB doc |
+| `createCompetitions.js` | `create-competitions` | Creates/updates the 12 seeded meets from `seed/meets.json`; `--late` back-dates fee deadlines | Writes Competition+Admin docs |
+| `planPanels.js` | `seed:panels:plan` | Draws random panel sizes (3/4/5) + seats **once** per meet, writes `seed/panel-plan.json`; refuses to overwrite without `--force` | Local file only — see *Panel Plan* |
+| `seatPanel.js` | `seed:panels:one` | Seats ONE panel category via the real admin HTTP API (single-category repair tool) | Live HTTP + Judge docs |
+| `seatPanels.js` | `seed:panels` | Seats every panel from the frozen plan via the admin API | Live HTTP + Judge docs across up to 15 meets |
+| `seedAccounts.js` | `seed` | Replays a capture straight into Mongo via the models (bypasses the service layer); dry-run by default | DB-direct when `--commit` |
+| `seedApi.js` | `seed:api` | The whole seed (admin/competitions/coaches/players/judges/squads) as real HTTP requests | Live HTTP, dozens of accounts/entries |
+| `seedScores.js` | `seed:scores`, `seed:scores:one` | Judges a whole meet (or all 12 with `--all`) over HTTP — posts slips, resolves tolerance mismatches, locks sheets — minutes instead of the ~7-hour Playwright equivalent | Live HTTP, hundreds of Score docs per meet |
+| `walkInFormFixture.js` | — (`node scripts/walkInFormFixture.js <dir> [--pdf]`) | Writes the walk-in form's page layouts (`layout.json`) and optionally the PDF, for the OCR sidecar's self-test. Reads no database | Local files only |
+| `payWithDiscount.js` | `pay:discount` | Final-submits + pays every/some seeded team via the real 100%-off discount endpoint (no fake signature) | Live HTTP; see [09-PAYMENTS.md](09-PAYMENTS.md) |
+| `setupAll.js` | `setup`, `setup:list`, `setup:dry` | Orchestrates the full seed chain end to end (mixes DB-direct/browser/API steps); `--from/--to/--only/--drop` | Can drop the whole DB |
+| `setupApi.js` | `setup:api`, `setup:api:list` | Same chain, every step after bootstrap goes over HTTP (no browser) | Live HTTP throughout |
+| `setupUi.js` | `setup:ui`, `setup:ui:list` | Same chain, driven through a real browser (Playwright specs in `Web/e2e`) | Slowest, most thorough — real browser against the real app |
+| `verifySeed.js` | (invoked internally by `setup-chain.js`) | Read-only invariant checker confirming a seeded DB is actually complete. "Published" now counts per **row**: finalized AND (whole-doc `isLocked` OR the row's apparatus in `lockedApparatus`) — the same two-gate rule the public results apply (it used to require whole-doc locks) | Pure read |
+| `seedTrials.js` | (`node scripts/seedTrials.js [--competition=SGAM-TRIALS-1] [--only=teams\|pay\|judges] [--dry-run]`) | Fills ONE existing meet over the real API: 5 teams (`SGAM-TRIALS-TEAM-A…E`), 300 athletes (6 per age group per team, every apparatus their gender is offered), pays via the discount code, registers 6 judges **without** seating them. Idempotent. Accounts `sgamtrials.<a-e>@example.com` etc., password `<Firstname>@2026` — see *TRIALS Seed* in project memory | Live HTTP, hundreds of accounts |
+| `captureEnvironment.js` | `seed:capture` | Reads a live DB, writes `seed/registrations.generated.json` for replay elsewhere | Read-only DB; 1 local file |
+
+See *Seed Chains*, *Seed Roster*, *Browser Seeding Traps* in project memory for the roster/timing detail behind these.
+
+## Ops / migrations
+
+| Script | npm script | What it does |
+|---|---|---|
+| `startup.js` | `start`, `start:check`, `prepare:db`, `indexes:sync` | The supervised boot path — see [01-ARCHITECTURE.md](01-ARCHITECTURE.md) |
+| `migrate.js` | `migrate:up`, `migrate:down`, `migrate:status` | CLI wrapper around `MigrationRunner` — `up`/`down` mutate schema; `status` is read-only. **No `--to` targeting** — always the full pending batch (`down` = just the most recent) |
+| `checkEnv.js` | `env:check` | Diffs `.env`/`.env.production` key sets against `.env_example`; `--fix` rewrites in template order, never copies dev values into prod. Prints key **names** only |
+| `meetStatus.js` | `meet:status` | Read-only report: per-category entered/submitted/judged/locked state + fee-window phase |
+| `gmail-oauth-token.js` | `gmail:token` | One-time, interactive: opens Google consent for a Desktop OAuth client and prints a `gmail.send` refresh token for `GMAIL_REFRESH_TOKEN` — after first refreshing it once against the same client, so the printed token is known-good; also prints its length to compare with Render. Reads `.env`; PowerShell needs `$env:VAR=` instead of inline `VAR=value`. Writes nothing. See [modules/email.md](modules/email.md) |
+| `generateOpenApi.js` | `docs:openapi`, `docs:openapi:check` | Builds `docs/openapi.json`/`.yaml` from `src/docs/openapi.js`; `--check` diffs against the live router and exits non-zero on drift |
+
+## Perf harness (`scripts/perf/`)
+
+See *API Perf Harness* in project memory
+for the two invariants that keep it honest. All of these run against a
+**separate, throwaway** perf DB (`PERF_MONGODB_URI`, default
+`mallakhamb_perf`) — `seedScale.js` explicitly refuses to run if that URI
+equals `MONGODB_URI` or doesn't look like a scratch DB name.
+
+| Script | Purpose |
+|---|---|
+| `seedScale.js` | Builds a competition of configurable size for benchmarking (teams × athletes, optional scores) |
+| `benchmarkApi.js` | Times every read endpoint at chosen scales, p50/p95/growth shape |
+| `countQueries.js` | Counts Mongoose round trips per request (finds N+1 patterns) |
+| `equivalence.js` | Diffs the old vs. new `getSubmittedTeams` implementation field-by-field on the same fixture |
+| `extract-routes.js` | Walks the live Express router stack, emits `routes.generated.json` — the ground truth used by the openapi-check diff |
+| `loadTest.js` | Concurrent load test at several concurrency levels |
+| `probe.js` | Response payload sizes, which fields dominate them |
+| `socketLoad.js` | Socket.IO connect time + slip fan-out latency/throughput |
+| `testApi.js` | Functional walk of the whole API in product order — the closest thing to an API-only E2E smoke suite (no longer probes the retired `GET /api/health/metrics`) |
+| `lib/harness-server.js` | Boots the real `createApp` in-process against a chosen Mongo URI |
+| `lib/client.js` | `ApiClient` — cookie jar + CSRF + Bearer + competition-context client mimicking the SPA |
+
+## `scripts/lib/` (shared, not npm-invoked directly)
+
+`admin-api.js` (HTTP client for panel-seating scripts), `competition-document.js`
+(canonical competition-doc builder, shared by Mongoose-direct and API
+chains), `judges.js`/`meets.js`/`panel-plan.js` (read/validate the JSON seed
+fixtures), `roster.js` (bridges CJS scripts to the ESM roster files under
+`Web/e2e/support/` via dynamic `import()` — so API and UI chains seed the
+same people), `setup-chain.js` (the shared engine behind `setupAll/Api/Ui.js`
+— locking via a lock file so only one seed run happens at a time, arg
+parsing, `--drop` confirmation, step runner, verification). The lock file is
+`scripts/seed/.setup-running`, or `SETUP_LOCK_PATH` when set — the OCI nightly
+run uses its own so it never collides with a manual seed on the same VM.
+`meets.js` applies `SEED_SEASON_LEAD_DAYS` (see below) through `shiftSeason`.
+
+## Env vars scripts read directly
+
+Scripts run outside the DI bootstrap, so several read `process.env` directly
+rather than through `config-manager.js`:
+
+| Var | Used by | Purpose |
+|---|---|---|
+| `SEED_ADMIN_PASSWORD` | `scripts/lib/admin-api.js` | Required to sign in as admin for panel-seating scripts (not defaulted — refuses if unset) |
+| `SEED_ADMIN_EMAIL` | `scripts/lib/admin-api.js`, `seedApi.js` | Defaults to `admin@gmail.com` |
+| `SEED_SUPERADMIN_EMAIL`/`SEED_SUPERADMIN_PASSWORD` | `seedApi.js`, `createSuperAdmin.js` | Default to the hardcoded local superadmin pair |
+| `SEED_SEASON_LEAD_DAYS` | `scripts/lib/meets.js` | Slides the fixed seed season forward so its first meet starts at least N days from today (whole days, else it throws). Set by the nightly e2e so the fee windows are always open; unset = the fixed dates. Test: `tests/unit/scripts/seed-season-shift.test.js` |
+| `SETUP_LOCK_PATH` | `scripts/lib/setup-chain.js` | Overrides the one-run-at-a-time lock file |
+| `SEED_API_URL` | `admin-api.js`, `seedScores.js`, `seedApi.js` | Where seed HTTP calls point; default `http://127.0.0.1:5000/api` |
+| `SEED_WORKERS` | `setupUi.js` | Playwright parallelism; default `4` |
+| `COMPETITION_PLACE` | `planPanels.js` | Which meet the panel plan treats as "default" |
+| `PERF_MONGODB_URI`, `PERF_BASE_URL`/`PERF_API_URL` | `scripts/perf/**` | Throwaway perf DB/API endpoints |
+| `OPENAPI_SERVER_URL` | `generateOpenApi.js` | Server URL embedded in the generated spec |
+| `DISCOUNT_CODE` | `payWithDiscount.js`, `setupUi.js` | Mirrors the config-manager var, read directly for the seed chain |
+
+Since 2026-10 a player registration under 18 needs `guardianConsent: true`;
+`seedApi.js` and `perf/testApi.js` send it (the seed roster is all minors).
+
+## Change guidance
+
+- A new one-off ops script: put it in `scripts/`, not `src/`; if it writes
+  to the DB, default to dry-run and require an explicit `--commit`/`--force`
+  flag (the established pattern — see `resetScores.js`, `syncDatabase.js`).
+- A new seed-chain step: wire it through `scripts/lib/setup-chain.js` so it
+  gets the shared locking/verification/`--drop` handling for free, rather
+  than reimplementing it.
+- Never point a perf script at the real `MONGODB_URI` — `seedScale.js`'s
+  refusal check is there because it's happened before.
+
+## Since the last pass (2026-10-30, against `4201319`)
+
+**Seed / e2e chain.** `scripts/seed/meets.json` gives every meet its own
+`competitionTypes`, rotating I+II+III, I+II, I+III, I (`lib/meets#competitionTypesOf`).
+`setup:api` (and `setup`) now run: … `pay` → `order` → `scores` (`--stage=one`,
+Competition I) → `results one` → `corrections` → **`finals`**
+(`seedCompetitionDay.js finals`: finalize-all as the admin, II/III rule
+checks, ties drawn, squads = qualifiers, admin reopen refused, Super Admin
+reopen + re-finalize, lots) → **`finals-panels`** (`seed:panels -- --finals`:
+Competition II seated after Finalize) → **`finals-scores`** (`seed:scores --
+--stage=finals`) → **`finals-results`** (`results finals`: every judged final
+started, no reopen) → `judge-screens` → `mail` → `coverage`. Panels:
+`lib/panel-plan#panelsForType` (every type per age group). Competition II is
+seated AFTER `finals` by `finals-panels` (`seatPanels.js --finals`): the meet's
+own judges or, every other meet, a relief panel (`lib/panel-plan#finalsPanelSeats`),
+and the slot's Competition I panel must stay as it was. Local run: launch config `api-e2e-local` (port 5001,
+`mallakhamb_local_e2e`) — **drop that DB first**; a stale DB keeps the old
+meet types and finals already started. Last full local run: 21/21 steps, 320
+categories.
+
+## Since the last pass (2026-10-31, against `f24bfcd`)
+
+New and changed scripts in `deploy/server/` (installed to `/usr/local/bin` on the VMs):
+
+- `mallakhamb-role [tick|status|takeover|is-active]`: role reconciler + automatic web failover
+  (`deploy/oci/AUTO-FAILOVER.md`); `ROLE_MODE=act|observe` in `/etc/mallakhamb/role.env`;
+  `/etc/mallakhamb/NO_AUTO_FAILOVER` on the standby pauses takeover. OCI is asked at most every
+  60 s (each CLI call costs ~1 s of the single core).
+- `mallakhamb-service-ip` (+ unit): brings the VM's secondary private IPs up from instance metadata.
+- `mallakhamb-backup-source`: the backup jobs read the **hidden db-03** through a
+  `directConnection` URI (a replica-set URI never selects a hidden member, so they used to read
+  app-02), falling back to the set with `secondaryPreferred` when db-03 is down or > 120 s behind.
+- `mallakhamb-backup`, `-oplog-slice`, `-offsite-copy` first ask `mallakhamb-role is-active` (fresh
+  OCI answer; falls back to the STANDBY marker), so a VM that just lost the IP never backs up twice.
+- `mallakhamb-promote` validates the Caddy config **as user caddy** and chowns `/var/log/caddy`
+  first (see GOTCHAS).
+- `mallakhamb-mongo-metrics` also writes each member's TLS certificate expiry.
+- Cloud Shell: `deploy/oci/scripts/service-ip-setup.sh`, `auto-failover-iam.sh`; `failover-ip.sh`
+  now only `move <nn>`.
+- `Server/scripts/perf/meetDay.js --target=<public API>` against a seedScale fixture is how the
+  failover-with-a-panel drill (readiness 6.8) was run; seedScale drops its target first and
+  refuses the API's own database, so it went into `mallakhambcompetition_prod_restoretest`.
+
+## Since the last pass (2026-11-11, against `f5465b4`)
+
+- **`npm run seed:demo`** (`scripts/seedDemo.js` + `scripts/demo/{cast,names,rng,score-model}.js`)
+  builds a believable 2026 season over the real API: 20 meets across all six
+  levels, 12 clubs, 180 athletes and 28 judges. It also plants the
+  judge-bias stories that the Fairness board should show. Guards: it writes
+  only to a database whose name contains `demo`, or one given with
+  `--allow-db`; it has no default super admin password; and it stops after
+  any failed step.
+- `createSuperAdmin.js` refuses a second owner and has
+  `--transfer-to <email>` to hand ownership over.
+- `seedScores.js` corrects each slip as **its own judge** (the Senior Judge
+  override is gone).
+- `seed/judges.json`: judges that were on Club are now International.
+
+## Chain steps added 2026-11-21 (walk-in desk v2 branch)
+
+- **`desk-v2`** (`scripts/seedDeskV2.js`, after `walkin`, both `setup:api` and `setup`): the desk without a camera, as the organiser Admin — Register player (typed, no email) → pay → refused (409 `TEAM_SUBMITTED`) → unlock with a reason (History `ENTRY_REOPENED`, actorType admin) → Excel template → parse (saves nothing) → import → re-import adds nobody → one more typed → only the 3 new players priced → pay → slip → squad 5/5 paid. Idempotent. Needs no OCR sidecar. Uses the desk's first open meet (Mumbai in the seeded season) and coach `desk.v2.coach@example.com`, team `DESK-V2-CLUB`.
+- **`owner-tools`** (`scripts/seedOwnerTools.js`, after `mail`, before `coverage`): Super Admin History (rename undone from History, double undo 422), Fix → Teams / Entries (reopen + resubmit a paid team; ₹100 cash in and refunded) / Scores / transfer preview, Accounts (phone corrected and put back, sign-out everywhere), Player teams; admin restore-edits and the fairness board (`?competition=`); Stats tabs for coach, player, judge; coach/player finals. Everything is put back so verifySeed holds. NOT covered on purpose: per-athlete unlock for judges (only a judge's Final Submit restores it) and cancelling a desk form (leaves the team entered) — Jest integration covers both.
+- **`seedCompetitionDay.js corrections`** now picks a row that can move (not `isAbsent`, final > 1): a desk entry can make a category the meet's Absent case.
+- Coverage of a full local run: 121/298 routes (was 92). Browser spec `Web/e2e/walk-in-desk.spec.js` (`test:e2e:desk`) drives the same desk flow through the screens.
+- Local full run: launch `api-e2e-full` (:5001, DB `mallakhamb_deskv2_e2e`, OCR on 8090) + `web-e2e-full` (:5178); run `setupApi.js --yes` with the same env.

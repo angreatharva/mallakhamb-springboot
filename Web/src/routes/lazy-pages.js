@@ -1,0 +1,43 @@
+import { lazy } from 'react';
+import { COACH_PAPER_FORM_ENABLED } from '@/config/features';
+
+export const Home = lazy(() => import('@/pages/public/Home'));
+export const PlayerLogin = lazy(() => import('@/pages/player/PlayerLogin'));
+export const PlayerTeamSelection = lazy(() => import('@/pages/player/PlayerTeamSelection'));
+export const PlayerDashboard = lazy(() => import('@/pages/player/PlayerDashboard'));
+export const CoachLogin = lazy(() => import('@/pages/coach/CoachLogin'));
+export const CoachCreateTeam = lazy(() => import('@/pages/coach/CoachCreateTeam'));
+export const CoachDashboard = lazy(() => import('@/pages/coach/CoachDashboard'));
+export const CoachPayment = lazy(() => import('@/pages/coach/CoachPayment'));
+// Off by default (config/features.js): a constant-false branch, so the build drops the chunk.
+export const CoachPaperForm = COACH_PAPER_FORM_ENABLED ? lazy(() => import('@/pages/coach/CoachPaperForm')) : null;
+export const AdminLogin = lazy(() => import('@/pages/admin/AdminLogin'));
+export const AdminRegister = lazy(() => import('@/pages/admin/AdminRegister'));
+export const SuperAdminLogin = lazy(() => import('@/pages/superadmin/SuperAdminLogin'));
+export const AdminDashboard = lazy(() => import('@/pages/admin/AdminDashboard'));
+export const SuperAdminDashboard = lazy(() => import('@/pages/superadmin/SuperAdminDashboard'));
+export const SuperAdminAddPlayerPayment = lazy(() => import('@/pages/superadmin/SuperAdminAddPlayerPayment'));
+export const AdminTeams = lazy(() => import('@/pages/admin/AdminTeams'));
+export const AdminScoring = lazy(() => import('@/pages/admin/AdminScoring'));
+export const JudgeLogin = lazy(() => import('@/pages/judge/JudgeLogin'));
+export const JudgeDashboard = lazy(() => import('@/pages/judge/JudgeDashboard'));
+export const JudgeProfile = lazy(() => import('@/pages/judge/JudgeProfile'));
+export const JudgeTeamPlayers = lazy(() => import('@/pages/judge/JudgeTeamPlayers'));
+export const JudgeScoring = lazy(() => import('@/pages/judge/JudgeScoring'));
+export const JudgePanelReview = lazy(() => import('@/pages/judge/JudgePanelReview'));
+export const JudgeSequence = lazy(() => import('@/pages/judge/JudgeSequence'));
+export const ForgotPassword = lazy(() => import('@/pages/shared/ForgotPassword'));
+// The account page behind the top-right menu, for every role but the judge (JudgeProfile).
+// A no-email player's reset with the code their coach was given.
+export const CoachCodeReset = lazy(() => import('@/pages/shared/CoachCodeReset'));
+export const AccountProfile = lazy(() => import('@/pages/shared/AccountProfile'));
+export const ResetPassword = lazy(() => import('@/pages/shared/ResetPassword'));
+export const NotFound = lazy(() => import('@/pages/shared/NotFound'));
+export const PublicScores = lazy(() => import('@/pages/public/PublicScores'));
+/*
+ * The look specimen (design-language PLAN Phase 3.3): dev and VITE_LOOK_OVERRIDE
+ * builds only. A constant-false branch, so a deployed build drops the chunk.
+ */
+export const LOOK_SPECIMEN_ENABLED = import.meta.env.DEV || import.meta.env.VITE_LOOK_OVERRIDE === '1';
+export const LookSpecimen = LOOK_SPECIMEN_ENABLED ? lazy(() => import('@/pages/dev/LookSpecimen')) : null;
+export const UnifiedRegister = lazy(() => import('@/pages/unified/UnifiedRegister'));

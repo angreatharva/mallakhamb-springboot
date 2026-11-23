@@ -1,0 +1,1237 @@
+/**
+ * ScorerScoring.jsx - Scoring interface for Scorers
+ *
+ * Reuses the AdminScoring UI but for scorer role access.
+ * Scorers can view and save scores (Time Keeper, Scorer name, Remarks)
+ * but cannot unlock scores (only superadmin has that permission).
+ */
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import apiConfig from '@/config/api.config';
+import { StatusTag } from '@/components/ui';
+import { JudgeHeader, ToleranceModal } from './judgeShared';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { io } from 'socket.io-client';
+import { Clock, Save, Lock, Eye, AlertCircle, AlertTriangle, ListOrdered } from 'lucide-react';
+import toast from 'react-hot-toast';
+import { createAdminAPI } from '@/services/user/admin.api';
+
+const scorerAPI = createAdminAPI('/judge');
+import { ResponsiveScoringTable } from '../../components/responsive/ResponsiveTable';
+import { analyzePanelMismatches, calculateAverageMarks, getTimeDeductionForTime, panelMarksComplete } from '@/utils/scoring/copRules';
+import { apparatusFor, apparatusKey, entryGender } from '@/utils/scoring/apparatus';
+import { mirrorChiefSeat, panelSeats, soleApparatus } from '@/utils/scoring/judgePanel';
+import { buildScorerRows, athletesAwaitingSeniorJudge } from './scorerRows';
+import { seatTypesFor, slipToBreakdown } from './useJudgePanelData';
+import { useRunningOrder, useOrderedTeamRows } from './useRunningOrder';
+import { logger } from '@/infrastructure/logger';
+import { secureStorage } from '@/utils/auth/secureStorage';
+import { alpha } from '../../styles/tokens';
+import ConfirmDialog from '@/components/auth/ConfirmDialog';
+import CompetitionLockBanner from '@/components/competition/CompetitionLockBanner';
+import { useCompetitionLock } from '@/hooks/useCompetitionLock';
+import { ageMatches } from '@/hooks/useAgeGroups';
+
+/*
+ * The Scorer types the time and the Other Deduction, nothing else. Judges'
+ * marks arrive from their own slips (socket + saved sheet) and are view-only
+ * here; the time deduction is derived from the time. User rules 2026-11-07
+ * (time only) and 2026-11-08 (Other Deduction too).
+ */
+const SCORER_EDITABLE_FIELDS = Object.freeze(['time', 'otherDeduction']);
+
+/** Other Deduction as typed: up to 10.00, two decimals, digits and a dot only. */
+const OTHER_DEDUCTION_PATTERN = /^\d{0,2}(\.\d{0,2})?$/;
+const OTHER_DEDUCTION_MAX = 10;
+
+/*
+ * A row lock holds what the Scorer accepted for that athlete. Older locks
+ * (before the Other Deduction was editable) stored the time alone as a
+ * string; newer ones store { time, otherDeduction }. Both read the same.
+ */
+const lockedTimeOf = (lock) => (lock && typeof lock === 'object' ? lock.time : lock);
+const lockedOtherOf = (lock) => (lock && typeof lock === 'object' ? lock.otherDeduction : undefined);
+
+/** Seat type -> the sheet field holding that judge's total. */
+const SEAT_FIELD = Object.freeze({
+  'Senior Judge': 'seniorJudge',
+  'Judge 1': 'judge1',
+  'Judge 2': 'judge2',
+  'Judge 3': 'judge3',
+  'Judge 4': 'judge4',
+});
+
+/** "1:05" or "65" -> seconds. */
+const timeToSeconds = (raw) => {
+  const timeStr = String(raw ?? '').trim();
+  if (timeStr.includes(':')) {
+    const [m, sec] = timeStr.split(':');
+    return (parseInt(m) || 0) * 60 + (parseInt(sec) || 0);
+  }
+  return parseInt(timeStr) || 0;
+};
+
+/** The time deduction cell for a time, as the sheet stores it ('' = none). */
+const deductionForTime = (raw) => {
+  const seconds = timeToSeconds(raw);
+  if (seconds <= 0) return '';
+  // Short of 60 s or over 90 s — the same table both ways.
+  const deduction = getTimeDeductionForTime(seconds);
+  return deduction > 0 ? deduction.toFixed(2) : '';
+};
+
+const ScorerScoring = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const activeSessionData = useMemo(() => {
+    if (location.state && location.state.selectedTeam && location.state.selectedCompetitionType) {
+      sessionStorage.setItem('scorer_scoring_active_session', JSON.stringify(location.state));
+      return location.state;
+    }
+    const saved = sessionStorage.getItem('scorer_scoring_active_session');
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }, [location.state]);
+
+  /*
+   * THE APPARATUS IS THE SCORER'S SEAT, AND IT WAS BEING DROPPED HERE.
+   *
+   * `JudgeDashboard` has always put `apparatus: selectedApparatus` into the
+   * navigation state, but this line destructured four fields out of five, so
+   * the sheet never knew which apparatus it was for. It listed every apparatus
+   * each athlete is entered for — three rows per athlete for a squad entered on
+   * all three — when a panel is seated for ONE of them and the Scorer sitting
+   * with it can only record that one.
+   *
+   * Older sessions stored in `scorer_scoring_active_session` before the picker
+   * existed have no apparatus, so this can still be undefined; everything below
+   * falls back to the previous squad-derived behaviour when it is.
+   */
+  const { selectedTeam, selectedCompetitionType, gender, ageGroup, apparatus: seatApparatus } =
+    activeSessionData || {};
+
+  /*
+   * PER-ATHLETE TIME LOCKS (user rule 2026-11-07).
+   *
+   * Once an athlete has performed, the Scorer locks the time they accepted.
+   * A locked time is read-only on the sheet, a late Time Keeper stopwatch for
+   * that athlete is ignored, and a reload of the saved sheet (another device
+   * saving fires one over the socket) cannot replace it. Kept in localStorage
+   * per team + category + apparatus so a refresh keeps the locks; the values
+   * are the locked times themselves, so a reload can put them back.
+   */
+  const timeLockKey = selectedTeam?._id
+    ? ['scorer_time_locks', selectedTeam._id, gender?.value || gender, ageGroup?.value || ageGroup,
+      selectedCompetitionType?.value, seatApparatus || 'all'].join('::')
+    : null;
+  const [timeLocks, setTimeLocks] = useState(() => {
+    if (!timeLockKey) return {};
+    try { return JSON.parse(localStorage.getItem(timeLockKey) || '{}') || {}; } catch { return {}; }
+  });
+  // Read by loadExistingScores, a stable callback that would otherwise see
+  // the locks as they were on the first render.
+  const timeLocksRef = useRef(timeLocks);
+  timeLocksRef.current = timeLocks;
+  useEffect(() => {
+    if (!timeLockKey) return;
+    try { localStorage.setItem(timeLockKey, JSON.stringify(timeLocks)); } catch { /* storage full or blocked */ }
+  }, [timeLocks, timeLockKey]);
+
+  /*
+   * UNSAVED TIMES SURVIVE A RELOAD (bug 2026-11-09).
+   *
+   * A Time Keeper's time — or one typed here — lives only on this sheet until
+   * the Scorer saves. The sheet re-reads the server on every Final Submit
+   * broadcast, and that re-read used to replace every row, so the times of
+   * the athletes timed earlier vanished. Every unsaved Time / Other Deduction
+   * is kept here (and in localStorage, so a refresh keeps it too) and laid
+   * back over each reload until a save writes it.
+   */
+  const draftKey = timeLockKey ? timeLockKey.replace('scorer_time_locks', 'scorer_unsaved_times') : null;
+  const draftsRef = useRef(null);
+  if (draftsRef.current === null) {
+    try { draftsRef.current = (draftKey && JSON.parse(localStorage.getItem(draftKey) || '{}')) || {}; } catch { draftsRef.current = {}; }
+  }
+  const writeDrafts = (next) => {
+    draftsRef.current = next;
+    if (!draftKey) return;
+    try { localStorage.setItem(draftKey, JSON.stringify(next)); } catch { /* storage full or blocked */ }
+  };
+  const recordDraft = (rowId, field, value) => {
+    const prev = draftsRef.current || {};
+    writeDrafts({ ...prev, [rowId]: { ...(prev[rowId] || {}), [field]: value } });
+  };
+
+  /** Put every unsaved and locked time, its deduction and Other Deduction back over a freshly loaded sheet. */
+  const withLockedTimes = (sheet) => {
+    const locks = timeLocksRef.current || {};
+    const next = { ...sheet };
+    Object.entries(draftsRef.current || {}).forEach(([rowId, draft]) => {
+      if (!next[rowId]) return;
+      const row = { ...next[rowId] };
+      if (draft.time !== undefined) {
+        row.time = draft.time;
+        row.deduction = String(draft.time).trim() ? deductionForTime(draft.time) : '';
+      }
+      if (draft.otherDeduction !== undefined) row.otherDeduction = draft.otherDeduction;
+      next[rowId] = row;
+    });
+    Object.entries(locks).forEach(([rowId, lock]) => {
+      if (!next[rowId]) return;
+      const time = lockedTimeOf(lock);
+      const other = lockedOtherOf(lock);
+      next[rowId] = {
+        ...next[rowId],
+        time,
+        deduction: deductionForTime(time),
+        ...(other !== undefined ? { otherDeduction: other } : {}),
+      };
+    });
+    return next;
+  };
+
+  const [socket, setSocket] = useState(null);
+  const [judges, setJudges] = useState([]);
+  // Every seat on this panel, the Scorer and Time Keeper included — `judges`
+  // above is the evaluation seats only, because its length picks the
+  // averaging rule.
+  const [panelStaff, setPanelStaff] = useState([]);
+  // Time Keeper times that arrived before the sheet finished loading.
+  const pendingTimesRef = useRef([]);
+  const [players, setPlayers] = useState([]);
+  const [scores, setScores] = useState({});
+  /*
+   * Each seat's Difficulty / Combination per row — { [rowId]: { [judgeType]:
+   * breakdown } }. The tolerance popup needs them: a D/C mismatch is resolved
+   * FIRST (user rule 2026-11-09), and from totals alone the Scorer could not
+   * tell one was open, so it showed the tolerance hit over it.
+   */
+  const [slipBreakdowns, setSlipBreakdowns] = useState({});
+  const [timeKeeper, setTimeKeeper] = useState('');
+  const [scorer, setScorer] = useState('');
+  const [remarks, setRemarks] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [isLocked, setIsLocked] = useState(false);
+  /*
+   * Two different reasons this sheet can be read-only, and they are not the
+   * same thing. `isLocked` means THIS entry was saved and finalized; the
+   * competition lock means the whole MEET has closed and nothing in it can
+   * change again. `readOnly` is the union, and is what the inputs and the save
+   * button read — each reason keeps its own banner so the Scorer is told which
+   * one applies.
+   */
+  const { locked: competitionLocked } = useCompetitionLock();
+  const readOnly = isLocked || competitionLocked;
+  // Athletes whose Senior Judge mark is still missing; Lock & Submit waits for them.
+  const seniorJudgeWaiting = athletesAwaitingSeniorJudge(players, scores);
+  const [existingScoreId, setExistingScoreId] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [ageGroupStarted, setAgeGroupStarted] = useState(false);
+  const [competitionType, setCompetitionType] = useState('Competition I');
+  const [calculatedScores, setCalculatedScores] = useState([]);
+  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  // The athlete the Scorer is about to mark absent (confirm dialog), or null.
+  const [absentTarget, setAbsentTarget] = useState(null);
+  const [confirmDialogConfig, setConfirmDialogConfig] = useState({ title: '', message: '', shouldLock: false });
+
+  // Get judge info from storage
+  const [judgeInfo, setJudgeInfo] = useState(null);
+
+  useEffect(() => {
+    const storedJudge = secureStorage.getItem('judge_user');
+    if (!storedJudge) {
+      toast.error('Please login first');
+      navigate('/judge/login');
+      return;
+    }
+    try {
+      const judge = JSON.parse(storedJudge);
+      setJudgeInfo(judge);
+      // The Scorer of THIS category — the account's first seat may be another
+      // (e.g. Time Keeper, when one person holds both).
+      const heldHere = seatTypesFor(judge, {
+        gender, ageGroup, competitionType: selectedCompetitionType?.value, apparatus: seatApparatus,
+      });
+      if (!heldHere.includes('Scorer') && judge.judgeType !== 'Scorer') {
+        toast.error('This page is only accessible to Scorers');
+        navigate('/judge/dashboard');
+      }
+    } catch {
+      secureStorage.removeItem('judge_user');
+      secureStorage.removeItem('judge_token');
+      toast.error('Invalid session. Please login again.');
+      navigate('/judge/login');
+    }
+  }, [navigate]); // eslint-disable-line react-hooks/exhaustive-deps -- read once, on arrival
+
+  // Stabilize selectedGender and selectedAgeGroup using useMemo
+  const selectedGender = useMemo(() => {
+    if (gender) {
+      return typeof gender === 'string' ? { value: gender, label: gender } : gender;
+    }
+    if (judgeInfo) {
+      return { value: judgeInfo.gender, label: judgeInfo.gender };
+    }
+    return null;
+  }, [gender, judgeInfo]);
+
+  const selectedAgeGroup = useMemo(() => {
+    if (ageGroup) {
+      return typeof ageGroup === 'string' ? { value: ageGroup, label: ageGroup } : ageGroup;
+    }
+    if (judgeInfo) {
+      return { value: judgeInfo.ageGroup, label: judgeInfo.ageGroup };
+    }
+    return null;
+  }, [ageGroup, judgeInfo]);
+
+  // Define loadExistingScores first (needed by fetchScoringData)
+  const loadExistingScores = useCallback(async (teamId, gender, ageGroup, initialScores, currentPlayers) => {
+    try {
+      // This team, THIS competition type: without the type, Competition I and II
+      // rows of the same athlete were loaded onto the same inputs.
+      const scoresParams = { teamId, gender, ageGroup };
+      if (selectedCompetitionType?.value) scoresParams.competitionType = selectedCompetitionType.value;
+      const allResponse = await scorerAPI.getTeamScores(scoresParams);
+
+      if (!allResponse?.data) {
+        setScores(withLockedTimes(initialScores));
+        return;
+      }
+
+      let teamsData = allResponse.data;
+      if (allResponse.data.success && allResponse.data.data) {
+        teamsData = allResponse.data.data;
+      } else if (!Array.isArray(allResponse.data)) {
+        teamsData = [allResponse.data];
+      }
+
+      const teamData = Array.isArray(teamsData) ? teamsData.find(t => t._id === teamId) || teamsData[0] : teamsData;
+
+      if (!teamData || !teamData.scores || teamData.scores.length === 0) {
+        toast('Starting fresh session', { icon: 'ℹ️' });
+        setScores(withLockedTimes(initialScores));
+        return;
+      }
+
+      const scoreMetadata = teamData.scoreMetadata;
+      if (scoreMetadata) {
+        /*
+         * Locked for THIS apparatus, not for the squad.
+         *
+         * One document holds all three apparatus, so reading its `isLocked`
+         * alone made the Pole panel's "Lock & Submit" hand the Rope and Hanging
+         * sheets back read-only. `isLocked` is now only the admin's whole-sheet
+         * freeze; `lockedApparatus` says which panels have finished.
+         */
+        const lockedSet = new Set((scoreMetadata.lockedApparatus || []).map(apparatusKey));
+        // With no seat apparatus — a meet that declares none, so the sheet still
+        // shows every apparatus — it is locked only once all of them are.
+        const onScreen = seatApparatus
+          ? [apparatusKey(seatApparatus)]
+          : [...new Set((currentPlayers || []).map(p => apparatusKey(p.apparatus)))];
+        const lockedHere = onScreen.length > 0 && onScreen.every(a => lockedSet.has(a));
+        setIsLocked(!!scoreMetadata.isLocked || lockedHere);
+        setExistingScoreId(scoreMetadata._id);
+        if (scoreMetadata.timeKeeper) setTimeKeeper(scoreMetadata.timeKeeper);
+        if (scoreMetadata.scorer) setScorer(scoreMetadata.scorer);
+        if (scoreMetadata.remarks) setRemarks(scoreMetadata.remarks);
+        if (scoreMetadata.competitionType) setCompetitionType(scoreMetadata.competitionType);
+        if (scoreMetadata.updatedAt) setLastUpdated(new Date(scoreMetadata.updatedAt));
+      }
+
+      if (teamData.scores && Array.isArray(teamData.scores)) {
+        setCalculatedScores(teamData.scores);
+      }
+
+      const existingScores = { ...initialScores };
+      const loadedBreakdowns = {};
+      const SLIP_ROLE = { SR_JUDGE: 'Senior Judge', SJ: 'Senior Judge', J1: 'Judge 1', J2: 'Judge 2', J3: 'Judge 3', J4: 'Judge 4' };
+      teamData.scores.forEach(ps => {
+        // Matched on athlete AND apparatus — a stored row belongs to exactly
+        // one of this sheet's rows, and matching on the athlete alone would
+        // pour a Rope result into the Pole row.
+        const wanted = apparatusKey(ps.apparatus);
+        let targetId = currentPlayers.find(
+          p => String(p.playerId) === String(ps.playerId) && apparatusKey(p.apparatus) === wanted
+        )?.id;
+        if (!targetId) {
+          targetId = currentPlayers.find(
+            p => p.name === ps.playerName && apparatusKey(p.apparatus) === wanted
+          )?.id;
+        }
+
+        if (targetId && Array.isArray(ps.judgeSlips)) {
+          ps.judgeSlips.forEach((slip) => {
+            const jt = SLIP_ROLE[slip.judgeRole] || slip.judgeRole;
+            if (jt && Number(slip.total) > 0) {
+              loadedBreakdowns[targetId] = { ...(loadedBreakdowns[targetId] || {}), [jt]: slipToBreakdown(slip) };
+            }
+          });
+        }
+        if (targetId && existingScores[targetId]) {
+          existingScores[targetId] = {
+            time: ps.time || '',
+            seniorJudge: ps.judgeScores?.seniorJudge !== undefined && ps.judgeScores?.seniorJudge !== null ? ps.judgeScores.seniorJudge.toString() : '',
+            judge1: ps.judgeScores?.judge1 !== undefined && ps.judgeScores?.judge1 !== null ? ps.judgeScores.judge1.toString() : '',
+            judge2: ps.judgeScores?.judge2 !== undefined && ps.judgeScores?.judge2 !== null ? ps.judgeScores.judge2.toString() : '',
+            judge3: ps.judgeScores?.judge3 !== undefined && ps.judgeScores?.judge3 !== null ? ps.judgeScores.judge3.toString() : '',
+            judge4: ps.judgeScores?.judge4 !== undefined && ps.judgeScores?.judge4 !== null ? ps.judgeScores.judge4.toString() : '',
+            deduction: ps.deduction !== undefined && ps.deduction !== null ? ps.deduction.toString() : '',
+            otherDeduction: ps.otherDeduction !== undefined && ps.otherDeduction !== null ? ps.otherDeduction.toString() : '',
+            // Marked absent by the Senior Judge (user rule 2026-11-15): 0.00,
+            // no time, nothing for the Scorer to record.
+            isAbsent: Boolean(ps.isAbsent),
+          };
+        }
+      });
+
+      setScores(withLockedTimes(existingScores));
+      setSlipBreakdowns(loadedBreakdowns);
+      toast.success(scoreMetadata?.isLocked ? 'Found locked scoring session' : 'Found existing scoring session');
+    } catch (error) {
+      logger.error('Error loading existing scores:', error);
+      toast.error('API call failed - starting fresh session');
+      setScores(withLockedTimes(initialScores));
+      setIsLocked(false);
+      setExistingScoreId(null);
+      setCalculatedScores([]);
+    }
+  }, []);
+
+  // Define fetchScoringData before useEffects that use it
+  const fetchScoringData = useCallback(async () => {
+    try {
+      setLoading(true);
+      if (!selectedGender?.value || !selectedAgeGroup?.value) return;
+
+      /*
+       * ASK FOR ONE APPARATUS' PANEL, NOT THE CATEGORY'S SEATS.
+       *
+       * A category is seated per apparatus now, so leaving this off returns
+       * every apparatus's panel concatenated — and `judges.length` below picks
+       * the averaging method. See utils/scoring/judgePanel.js.
+       *
+       * The Scorer's own seat answers this directly — they sit with ONE panel —
+       * so it is preferred over anything inferred from the squad. Deriving it
+       * from the entries only works while a squad is entered for a single
+       * apparatus; one spanning all three yields nothing, the filter comes off,
+       * and the query returns three panels concatenated.
+       */
+      const teamApparatus = seatApparatus || soleApparatus(
+        (selectedTeam.players || [])
+          .filter(pe => entryGender(pe) === selectedGender.value && ageMatches(pe.ageGroup, selectedAgeGroup.value))
+          .flatMap(pe => apparatusFor(pe, selectedCompetitionType?.value).map(a => ({ apparatus: a })))
+      );
+
+      const judgesParams = { gender: selectedGender.value, ageGroup: selectedAgeGroup.value };
+      if (selectedCompetitionType?.value) judgesParams.competitionTypes = selectedCompetitionType.value;
+      if (teamApparatus) judgesParams.apparatus = teamApparatus;
+      const judgesResponse = await scorerAPI.getJudges(judgesParams);
+      const judgesData = judgesResponse.data.data || judgesResponse.data;
+      setJudges(panelSeats(judgesData, teamApparatus));
+      setPanelStaff(Array.isArray(judgesData) ? judgesData : []);
+
+      const summaryParams = {};
+      const summaryResponse = await scorerAPI.getAllJudgesSummary(summaryParams);
+      const summaryData = summaryResponse.data.data?.summary || summaryResponse.data.summary || [];
+      const ageGroupInfo = summaryData.find(item =>
+        item.gender === selectedGender.value && item.ageGroup === selectedAgeGroup.value
+      );
+      const compTypeStarted = selectedCompetitionType ?
+        ageGroupInfo?.competitionTypes?.[selectedCompetitionType.value]?.isStarted || false :
+        ageGroupInfo?.isStarted || false;
+      setAgeGroupStarted(compTypeStarted);
+
+      if (selectedCompetitionType?.label) {
+        const match = selectedCompetitionType.label.match(/^(Competition [I]+)/);
+        setCompetitionType(match ? match[1] : 'Competition I');
+      }
+
+      // One row per (athlete, apparatus), narrowed to this Scorer's seat.
+      // See scorerRows.js for why both halves of that matter.
+      const teamPlayers = buildScorerRows({
+        team: selectedTeam,
+        gender: selectedGender.value,
+        ageGroup: selectedAgeGroup.value,
+        competitionType: selectedCompetitionType?.value,
+        apparatus: seatApparatus,
+      });
+      setPlayers(teamPlayers);
+
+      const initialScores = {};
+      teamPlayers.forEach(p => {
+        initialScores[p.id] = {
+          time: '', seniorJudge: '', judge1: '', judge2: '', judge3: '', judge4: '', deduction: '', otherDeduction: ''
+        };
+      });
+      setScores(withLockedTimes(initialScores));
+      await loadExistingScores(selectedTeam._id, selectedGender.value, selectedAgeGroup.value, initialScores, teamPlayers);
+    } catch (error) {
+      logger.error('Error fetching scoring data:', error);
+      toast.error('Failed to load scoring data');
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedGender, selectedAgeGroup, selectedCompetitionType, selectedTeam, loadExistingScores]);
+
+  useEffect(() => {
+    if (!selectedTeam || !selectedGender || !selectedAgeGroup) {
+      navigate('/judge/dashboard');
+      return;
+    }
+    fetchScoringData();
+  }, [selectedTeam, selectedGender, selectedAgeGroup, navigate]);
+
+  useEffect(() => {
+    if (!judgeInfo) return;
+    const socketUrl = apiConfig.getSocketUrl();
+    const token = secureStorage.getItem('judge_token');
+
+    const newSocket = io(socketUrl, {
+      auth: { token },
+      withCredentials: true
+    });
+
+    setSocket(newSocket);
+    newSocket.on('connect', () => {
+      setIsConnected(true);
+      logger.info('Scorer socket connected successfully');
+
+      const genderVal = selectedGender?.value || selectedGender || judgeInfo.gender;
+      const ageGroupVal = selectedAgeGroup?.value || selectedAgeGroup || judgeInfo.ageGroup;
+      const compTypeVal = selectedCompetitionType?.value || selectedCompetitionType || 'competition_1';
+
+      if (genderVal && ageGroupVal && compTypeVal) {
+        const roomId = `scoring_${genderVal}_${ageGroupVal}_${compTypeVal}`;
+        newSocket.emit('join_scoring_room', { roomId });
+        logger.info(`Joined scoring room: ${roomId}`);
+      }
+    });
+    newSocket.on('disconnect', () => {
+      setIsConnected(false);
+      logger.info('Scorer socket disconnected');
+    });
+    newSocket.on('connect_error', (error) => {
+      setIsConnected(false);
+      logger.error('Scorer socket connection error:', error);
+    });
+    newSocket.on('error', (error) => {
+      logger.error('Socket error:', error);
+    });
+    return () => newSocket.disconnect();
+  }, [judgeInfo, selectedCompetitionType, selectedGender, selectedAgeGroup]);
+
+  useEffect(() => {
+    if (!socket) return;
+    const handleScoreUpdate = (data) => {
+      if (isLocked) return;
+      // The slip broadcasts the athlete and the apparatus it was scored on;
+      // the row it belongs to is the pair.
+      const rowId = `${data.playerId}::${apparatusKey(data.apparatus)}`;
+      if (!players.some(p => p.id === rowId)) return;
+
+      const fieldMap = {
+        'Senior Judge': 'seniorJudge',
+        'Judge 1': 'judge1',
+        'Judge 2': 'judge2',
+        'Judge 3': 'judge3',
+        'Judge 4': 'judge4'
+      };
+      const fieldName = fieldMap[data.judgeType] || (data.judgeNo ? `judge${data.judgeNo}` : 'seniorJudge');
+
+      setScores(prev => {
+        const row = prev[rowId] || {};
+        return { ...prev, [rowId]: { ...row, [fieldName]: data.score.toString() } };
+      });
+      if (data.breakdown && data.judgeType) {
+        setSlipBreakdowns(prev => ({ ...prev, [rowId]: { ...(prev[rowId] || {}), [data.judgeType]: data.breakdown } }));
+      }
+      setLastUpdated(new Date());
+    };
+    // Another team's Final Submit is not this sheet's business: re-reading
+    // on it only churned the sheet (and used to wipe unsaved times).
+    const handleScoresSaved = (data) => {
+      if (data?.teamId && String(data.teamId) !== String(selectedTeam?._id)) return;
+      fetchScoringData();
+    };
+    /*
+     * The Time Keeper stopped the clock on an athlete: fill that row's Time.
+     * Through handleScoreChange, exactly as if it had been typed, so the time
+     * deduction is worked out the same way. A time for another team's sheet,
+     * or a row this sheet does not have, is not ours.
+     */
+    const handleTimeRecorded = (data) => {
+      if (readOnly || !data || data.ack) return;
+      if (data.teamId && String(data.teamId) !== String(selectedTeam?._id)) return;
+      // Still loading: the saved scores are about to replace every row, so
+      // hold the time and apply it once they have (see the effect below).
+      if (loading) {
+        pendingTimesRef.current.push(data);
+        return;
+      }
+      applyRecordedTime(data);
+    };
+
+    socket.on('score_updated', handleScoreUpdate);
+    socket.on('scores_saved_notification', handleScoresSaved);
+    socket.on('time_recorded', handleTimeRecorded);
+
+    return () => {
+      socket.off('score_updated', handleScoreUpdate);
+      socket.off('scores_saved_notification', handleScoresSaved);
+      socket.off('time_recorded', handleTimeRecorded);
+    };
+  }, [socket, players, isLocked, readOnly, loading, selectedTeam, fetchScoringData]); // eslint-disable-line react-hooks/exhaustive-deps -- handleScoreChange is recreated every render
+
+  // Times that arrived while the sheet was loading, applied once it has.
+  useEffect(() => {
+    if (loading || pendingTimesRef.current.length === 0) return;
+    const pending = pendingTimesRef.current;
+    pendingTimesRef.current = [];
+    pending.forEach(applyRecordedTime);
+  }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps -- applyRecordedTime is recreated every render
+
+  /*
+   * WHAT THE SHEET DRAWS IS NOT WHAT THE PANEL IS.
+   *
+   * A 4-judge panel is scored as a five: the Sr. Judge's mark fills the vacant
+   * fourth evaluation slot, and drop-high-low then runs over four marks of
+   * which one is the Chief's. The sheet used to draw four columns and print an
+   * Average computed over five marks — the fifth appearing nowhere. It now
+   * draws five, the last of them the Sr. Judge's own cell repeated.
+   *
+   * `judges` stays the SEATS that were staffed. It is what records the panel in
+   * `judgeDetails`, and its length is what picks the averaging method — the
+   * copy must never be counted there. See mirrorChiefSeat.
+   */
+  const sheetSeats = useMemo(() => mirrorChiefSeat(judges), [judges]);
+
+  /*
+   * Time Keeper and Scorer names, filled in rather than typed: the Time Keeper
+   * seated on this panel, and the Scorer signed in here. Only into an empty
+   * field once the sheet has loaded — a name saved with the sheet wins, and a
+   * name the Scorer changes by hand is left alone.
+   */
+  const timeKeeperSeatName = useMemo(() => {
+    const seats = panelStaff.filter(j => j.judgeType === 'Time Keeper' && j.name?.trim());
+    const own = seats.find(j => seatApparatus && j.apparatus === seatApparatus);
+    return (own || seats[0])?.name || '';
+  }, [panelStaff, seatApparatus]);
+  const scorerSelfName = judgeInfo?.name
+    || [judgeInfo?.firstName, judgeInfo?.lastName].filter(Boolean).join(' ');
+
+  useEffect(() => {
+    if (loading || readOnly) return;
+    if (timeKeeperSeatName) setTimeKeeper(prev => (prev?.trim() ? prev : timeKeeperSeatName));
+    if (scorerSelfName) setScorer(prev => (prev?.trim() ? prev : scorerSelfName));
+  }, [loading, readOnly, timeKeeperSeatName, scorerSelfName]);
+  const seatedPanelSize = judges.length || undefined;
+
+  /*
+   * TOLERANCE HITS (user rule 2026-11-07).
+   *
+   * The Senior Judge gets a popup when a 4- or 5-judge panel's execution
+   * average and the Senior's mark are further apart than COP §3.4 allows; the
+   * Scorer got nothing. Each athlete whose seated panel has all marked and
+   * breaches is a hit, worked out by the same analyzePanelMismatches the
+   * Senior Judge's screen uses. Keyed by the marks, so a corrected-but-still-
+   * breaching panel pops up again after a dismissal.
+   */
+  const toleranceHits = useMemo(() => {
+    if (!seatedPanelSize || seatedPanelSize < 4) return [];
+    return players.flatMap((p) => {
+      const row = scores[p.id] || {};
+      // A seat not yet marked is stored as 0, not left blank: it is not a
+      // mark, and counting it fired the popup on an incomplete panel (bug
+      // 2026-11-08). Wait for every seated judge, by the server's rule.
+      if (!panelMarksComplete(row, seatedPanelSize)) return [];
+      const panel = {};
+      judges.forEach((j) => {
+        const field = SEAT_FIELD[j.judgeType];
+        const value = parseFloat(row[field]);
+        if (field && Number.isFinite(value) && value > 0) {
+          // An unknown breakdown is `detailed: false` with no totals, so it is
+          // skipped by the D/C comparison rather than read as zeros.
+          const breakdown = slipBreakdowns[p.id]?.[j.judgeType] || { detailed: false };
+          panel[j.judgeType] = { judgeType: j.judgeType, score: value, breakdown };
+        }
+      });
+      const analysis = analyzePanelMismatches(panel, seatedPanelSize);
+      // A Difficulty / Combination mismatch still open hides the tolerance
+      // hit — the marks are about to change (hasToleranceBreach says so).
+      if (!analysis.hasToleranceBreach) return [];
+      const key = `${p.id}|${judges.map((j) => row[SEAT_FIELD[j.judgeType]]).join(',')}`;
+      return [{ rowId: p.id, name: p.name, key, analysis, panel }];
+    });
+  }, [players, scores, judges, seatedPanelSize, slipBreakdowns]);
+  const [dismissedTolerance, setDismissedTolerance] = useState(() => new Set());
+  const [reopenToleranceKey, setReopenToleranceKey] = useState(null);
+  const shownToleranceHit = toleranceHits.find((h) => h.key === reopenToleranceKey)
+    || (readOnly ? null : toleranceHits.find((h) => !dismissedTolerance.has(h.key)))
+    || null;
+  const closeTolerance = () => {
+    if (shownToleranceHit) setDismissedTolerance((prev) => new Set(prev).add(shownToleranceHit.key));
+    setReopenToleranceKey(null);
+  };
+  const judgeNameMap = useMemo(
+    () => Object.fromEntries(judges.filter((j) => j.name).map((j) => [j.judgeType, j.name])),
+    [judges],
+  );
+
+  /*
+   * Panel averaging comes from copRules, the same module the judges' own pages
+   * and the score table use. This file used to carry a private copy that took
+   * the MEDIAN of three execution marks where copRules took the mean, so a
+   * 4-judge panel produced one number in the table on this screen and a
+   * different one in the payload this screen posted. The panel-size rules live
+   * in one place now; see calculateAverageMarks there.
+   */
+  const panelAverage = (playerScores) => calculateAverageMarks(playerScores, seatedPanelSize);
+
+  // The sheet is one team on one apparatus, both named at the top — the line
+  // under each athlete's name repeated them on every row.
+  // The category's running order, live: a Senior Judge's or Scorer's
+  // re-sequence lands here without a reload (bug 2026-11-09).
+  const orderCategory = useMemo(() => ({
+    competitionId: judgeInfo?.competition?._id || judgeInfo?.competition,
+    gender: selectedGender?.value,
+    ageGroup: selectedAgeGroup?.value,
+    competitionType: selectedCompetitionType?.value,
+  }), [judgeInfo, selectedGender, selectedAgeGroup, selectedCompetitionType]);
+  const runningOrder = useRunningOrder(orderCategory);
+  const orderedPlayers = useOrderedTeamRows(players, selectedTeam?._id, runningOrder);
+  // An absent athlete is tagged "Absent" by the table itself (onMarkAbsent).
+  const tableRows = useMemo(
+    () => orderedPlayers.map(({ teamName: _teamName, lotNo: _lot, runningPosition: _pos, ...row }) => row),
+    [orderedPlayers],
+  );
+
+  /*
+   * ABSENT from the Scorer's sheet (user rule 2026-11-16): the Scorer, like
+   * the Senior Judge, marks an athlete who did not perform. The server
+   * overrides every scoring rule and saves 0.00 for every judge, time 0, no
+   * deduction, final score 0, finalized for the whole panel. Offered only
+   * while the Senior Judge has no mark on the athlete (a final panel score is
+   * the admin's to reopen). Throws so the confirm dialog stays open and says why.
+   */
+  const canMarkAbsent = (row) => !readOnly && !(parseFloat(scores[row.id]?.seniorJudge) > 0);
+  const markAbsent = async () => {
+    const row = absentTarget;
+    if (!row) return;
+    try {
+      await scorerAPI.saveScores({
+        markAbsent: true,
+        playerId: row.playerId,
+        playerName: row.name,
+        teamId: selectedTeam._id,
+        gender: selectedGender.value,
+        ageGroup: selectedAgeGroup.value,
+        competitionType: selectedCompetitionType?.value || competitionType,
+        competitionId: judgeInfo?.competition?._id || judgeInfo?.competition,
+        apparatus: row.apparatus,
+      });
+    } catch (error) {
+      throw new Error(error.response?.data?.error?.message || 'Could not mark the athlete absent. Please try again.');
+    }
+    setScores((prev) => ({
+      ...prev,
+      [row.id]: {
+        ...(prev[row.id] || {}),
+        isAbsent: true, time: '0', seniorJudge: '0', judge1: '0', judge2: '0', judge3: '0', judge4: '0',
+        deduction: '0', otherDeduction: '0',
+      },
+    }));
+    setAbsentTarget(null);
+    toast.success(`${row.name} marked absent: 0.00 saved for the whole panel`);
+    fetchScoringData?.();
+  };
+
+  const calculateFinalScore = (ps) => {
+    const r = panelAverage(ps);
+    return Math.max(0, r.average - (parseFloat(ps.deduction) || 0) - (parseFloat(ps.otherDeduction) || 0)).toFixed(2);
+  };
+
+  const handleScoreChange = (playerId, field, value) => {
+    if (isLocked) {
+      toast.error('Cannot edit scores - this entry is locked');
+      return;
+    }
+    // Only the time and the Other Deduction are the Scorer's to change; the
+    // table already draws every other cell read-only, this is the backstop.
+    if (!SCORER_EDITABLE_FIELDS.includes(field)) return;
+    if (timeLocksRef.current?.[playerId] !== undefined) {
+      toast.error('This athlete is locked. Unlock to change it.');
+      return;
+    }
+
+    if (field === 'otherDeduction') {
+      const text = String(value ?? '').trim();
+      if (!OTHER_DEDUCTION_PATTERN.test(text)) return;
+      if (text !== '' && text !== '.' && parseFloat(text) > OTHER_DEDUCTION_MAX) {
+        toast.error(`Other Deduction can be at most ${OTHER_DEDUCTION_MAX.toFixed(2)}`, { id: 'other-deduction-max' });
+        return;
+      }
+      setScores(prev => ({ ...prev, [playerId]: { ...prev[playerId], otherDeduction: text } }));
+      recordDraft(playerId, 'otherDeduction', text);
+      setLastUpdated(new Date());
+      return;
+    }
+    recordDraft(playerId, 'time', String(value ?? ''));
+
+    setScores(prev => {
+      const updatedPlayer = { ...prev[playerId], time: value };
+      const timeStr = String(value).trim();
+      if (timeToSeconds(timeStr) > 0) updatedPlayer.deduction = deductionForTime(timeStr);
+      else if (timeStr === '') updatedPlayer.deduction = '';
+      return { ...prev, [playerId]: updatedPlayer };
+    });
+    setLastUpdated(new Date());
+  };
+
+  /** Lock or unlock one athlete's time. Locking needs a time to lock. */
+  const toggleTimeLock = (rowId) => {
+    if (readOnly) return;
+    const row = players.find(p => p.id === rowId);
+    const name = row?.name || 'this athlete';
+    if (timeLocks[rowId] !== undefined) {
+      setTimeLocks(({ [rowId]: _gone, ...rest }) => rest);
+      toast.success(`Time unlocked for ${name}`);
+      return;
+    }
+    const time = String(scores[rowId]?.time ?? '').trim();
+    if (!time) {
+      toast.error(`Enter a time for ${name} before locking it`);
+      return;
+    }
+    // The Other Deduction is locked with the time: the row is what the
+    // Scorer accepted for this athlete.
+    const otherDeduction = String(scores[rowId]?.otherDeduction ?? '').trim();
+    setTimeLocks(prev => ({ ...prev, [rowId]: { time, otherDeduction } }));
+    toast.success(`Time ${time} locked for ${name}`);
+  };
+
+  /** Put a Time Keeper's time into its athlete's row, as if it were typed. */
+  const applyRecordedTime = (data) => {
+    if (readOnly) return;
+    const rowId = `${data.playerId}::${apparatusKey(data.apparatus)}`;
+    const row = players.find(p => p.id === rowId);
+    if (!row) return;
+    // The Scorer locked this athlete's time: a later stopwatch reading for
+    // them is not allowed to replace it.
+    if (timeLocksRef.current?.[rowId] !== undefined) {
+      toast(`${row.name}: time is locked, new time ${data.seconds} s ignored`, { id: `time-locked-${rowId}` });
+      return;
+    }
+    handleScoreChange(rowId, 'time', String(data.seconds));
+    if (data.timeKeeperName) setTimeKeeper(prev => (prev?.trim() ? prev : data.timeKeeperName));
+    toast.success(`Time ${data.seconds} s recorded for ${row.name}`);
+  };
+
+  const handleSaveScores = async () => {
+    if (isLocked) {
+      toast.error('Cannot save - this entry is already locked');
+      return;
+    }
+
+    if (competitionLocked) {
+      toast.error('This competition has closed. Scores can no longer be changed.');
+      return;
+    }
+
+    if (!timeKeeper?.trim()) {
+      toast.error('Time Keeper name is required');
+      return;
+    }
+    if (!scorer?.trim()) {
+      toast.error('Scorer name is required');
+      return;
+    }
+
+    const hasAnyScores = players.some(p => {
+      const ps = scores[p.id];
+      return ps && (ps.seniorJudge || ps.judge1 || ps.judge2 || ps.judge3 || ps.judge4);
+    });
+    if (!hasAnyScores) {
+      toast.error('Please enter at least some scores before saving');
+      return;
+    }
+
+    const playersWithoutTime = players.filter(p => {
+      const ps = scores[p.id];
+      return !ps?.isAbsent && !ps?.time?.trim();
+    });
+
+    if (playersWithoutTime.length > 0) {
+      const playerNames = playersWithoutTime.map(p => p.name).join(', ');
+      toast.error(`Time is required for all players. Missing for: ${playerNames}`);
+      return;
+    }
+
+    const allPlayersScored = players.every(p => {
+      const ps = scores[p.id];
+      if (!ps) return false;
+      const hasJudge = (ps.seniorJudge && parseFloat(ps.seniorJudge) > 0) || (ps.judge1 && parseFloat(ps.judge1) > 0) || (ps.judge2 && parseFloat(ps.judge2) > 0) || (ps.judge3 && parseFloat(ps.judge3) > 0) || (ps.judge4 && parseFloat(ps.judge4) > 0);
+      return ps.isAbsent || (hasJudge && ps.time?.trim());
+    });
+    // Lock & Submit waits for the Senior Judge's mark on every athlete
+    // (user rule 2026-11-11); until then this is a draft save.
+    const awaiting = athletesAwaitingSeniorJudge(players, scores);
+    const shouldLock = allPlayersScored && awaiting.length === 0;
+
+    const dialogTitle = shouldLock ? 'Lock & Submit Scores' : 'Save Scores as Draft';
+    const dialogMessage = shouldLock
+      ? '⚠️ WARNING: Once scores are submitted and locked, they CANNOT be changed.\n\nAre you sure you want to proceed?'
+      : awaiting.length > 0
+        ? `The Senior Judge has not marked ${awaiting.join(', ')} yet, so these scores can only be saved as a draft. Lock & Submit opens once the Senior Judge has marked every athlete.\n\nSave as draft?`
+        : 'Save scores as draft? You can edit them later before locking.';
+
+    setConfirmDialogConfig({ title: dialogTitle, message: dialogMessage, shouldLock });
+    setShowConfirmDialog(true);
+  };
+
+  const handleConfirmSave = async () => {
+    const shouldLock = confirmDialogConfig.shouldLock;
+
+    try {
+      const competitionId = judgeInfo?.competition?._id || judgeInfo?.competition;
+      const scoringData = {
+        teamId: selectedTeam._id,
+        teamName: selectedTeam.name,
+        coachName: selectedTeam.coach?.name,
+        coachEmail: selectedTeam.coach?.email,
+        gender: selectedGender.value,
+        ageGroup: selectedAgeGroup.value,
+        competitionType,
+        timeKeeper,
+        scorer,
+        remarks,
+        isLocked: shouldLock,
+        playerScores: players.map(p => {
+          const r = panelAverage(scores[p.id]);
+          return {
+            playerId: p.playerId,
+            playerName: p.name,
+            apparatus: p.apparatus,
+            time: scores[p.id].time,
+            judgeScores: {
+              seniorJudge: parseFloat(scores[p.id].seniorJudge) || 0,
+              judge1: parseFloat(scores[p.id].judge1) || 0,
+              judge2: parseFloat(scores[p.id].judge2) || 0,
+              judge3: parseFloat(scores[p.id].judge3) || 0,
+              judge4: parseFloat(scores[p.id].judge4) || 0
+            },
+            executionAverage: r.executionAvg,
+            baseScore: r.baseScore,
+            baseScoreApplied: r.baseScoreApplied,
+            toleranceUsed: r.tolerance,
+            averageMarks: r.average,
+            deduction: parseFloat(scores[p.id].deduction) || 0,
+            otherDeduction: parseFloat(scores[p.id].otherDeduction) || 0,
+            finalScore: parseFloat(calculateFinalScore(scores[p.id]))
+          };
+        }),
+        // Who sat, by name and seat. No email: this record is served by the
+        // anonymous results feed, and a judge's email is their login
+        // (security audit 2026-10-31, M1).
+        judgeDetails: judges.map(j => ({ judgeId: j._id, judgeName: j.name, judgeType: j.judgeType }))
+      };
+
+      if (competitionId) {
+        scoringData.competition = competitionId;
+      }
+
+      const response = await scorerAPI.saveScores(scoringData);
+
+      const responseData = response.data.data || response.data;
+      const {
+        scoreId, isLocked: responseLocked, lockedApparatus, playerScores: calculatedPlayerScores,
+      } = responseData;
+
+      setCalculatedScores(calculatedPlayerScores || []);
+      // Saved: the server holds every time on the sheet now.
+      writeDrafts({});
+      /*
+       * A Scorer's lock is recorded against the apparatus, not the document, so
+       * `responseLocked` stays false for it — reading that alone handed the
+       * sheet straight back as editable after a successful "Lock & Submit".
+       */
+      const lockedSet = new Set((lockedApparatus || []).map(apparatusKey));
+      const onScreen = seatApparatus
+        ? [apparatusKey(seatApparatus)]
+        : [...new Set(players.map(p => apparatusKey(p.apparatus)))];
+      setIsLocked(!!responseLocked || (onScreen.length > 0 && onScreen.every(a => lockedSet.has(a))));
+      setExistingScoreId(scoreId);
+
+      toast.success(
+        responseLocked
+          ? '🎉 Scores saved and locked! Calculations complete.'
+          : 'Scores saved as draft with automatic calculations.',
+        { duration: 3000 }
+      );
+
+      if (socket && selectedGender?.value && selectedAgeGroup?.value && selectedCompetitionType?.value) {
+        socket.emit('scores_saved', {
+          teamId: selectedTeam._id,
+          roomId: `scoring_${selectedGender.value}_${selectedAgeGroup.value}_${selectedCompetitionType.value}`,
+          isLocked: responseLocked
+        });
+      }
+    } catch (error) {
+      logger.error('Error saving scores:', error);
+      const errorMessage = error.response?.data?.message || 'Failed to save scores';
+      toast.error(errorMessage);
+      throw error;
+    }
+  };
+
+  const darkInput = `w-full rounded-xl text-base mouse:text-sm text-ink placeholder-ink/30 min-h-[44px] px-3 py-2.5 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed`;
+  const darkInputStyle = (disabled) => ({
+    background: disabled ? 'rgb(var(--ink) / 0.02)' : 'rgb(var(--ink) / 0.04)',
+    border: `1px solid var(--line-strong)`
+  });
+
+  if (loading) {
+    return (
+      <div className="min-h-dvh flex items-center justify-center bg-bg">
+        <div className="text-center">
+          <div className="w-10 h-10 border-2 border-ink/10 rounded-full mx-auto mb-4 animate-spin border-t-accent"/>
+          <p className="text-fg-muted text-sm">Loading scoring page…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!selectedTeam || !selectedGender || !selectedAgeGroup) {
+    return (
+      <div className="min-h-dvh flex items-center justify-center bg-bg">
+        <div className="text-center">
+          <p className="text-fg-muted mb-4">Invalid scoring session. Please go back and select a team.</p>
+          <button onClick={() => navigate('/judge/dashboard')} className="px-5 py-2.5 rounded-xl text-sm font-bold text-on-accent min-h-[44px]" style={{ background: 'rgb(var(--accent))' }}>
+            Back to Dashboard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-dvh bg-bg text-fg">
+      <JudgeHeader
+        wide
+        back={{ label: 'Back to Dashboard', onClick: () => navigate('/judge/dashboard') }}
+        title="Scorer Scoring"
+        subtitle={isLocked ? 'Scores locked' : null}
+        status={isLocked ? <StatusTag status="danger">Locked</StatusTag> : null}
+        live={isLocked ? null : isConnected}
+        actions={(
+          /*
+           * The Scorer sets the running order as well as recording the
+           * marks — they are the person watching the floor, and the order
+           * changes there (a withdrawal, an athlete not ready) long after
+           * the lots were drawn. The server allows it (SEQUENCE_JUDGE_TYPES
+           * is Senior Judge and Scorer); until now the only way in was the
+           * dashboard, which meant leaving a half-filled sheet to reach it.
+           *
+           * /judge/sequence reads the category from the same sessionStorage
+           * keys the dashboard wrote on the way here.
+           */
+          <button onClick={() => navigate('/judge/sequence')} className="ui-btn ui-btn--line ui-btn--sm">
+            <span className="ui-btn__label" style={{ display: 'contents' }}>
+              <ListOrdered aria-hidden="true" />
+              <span className="hidden sm:inline">Set Sequence</span>
+            </span>
+          </button>
+        )}
+      />
+
+      <div className="max-w-7xl mx-auto px-4 md:px-8 py-8 space-y-6">
+        <CompetitionLockBanner />
+
+        {isLocked && (
+          <div className="rounded-2xl border p-4 flex items-center justify-between gap-4 bg-surface-sunken border-line">
+            <div className="flex items-center gap-3">
+              <AlertCircle className="w-5 h-5 flex-shrink-0 text-danger-fg"/>
+              <div>
+                <p className="font-bold text-ink text-sm">Scoring session is locked</p>
+                <p className="text-xs mt-0.5 text-fg-muted">Scores saved and locked. Cannot be modified.</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Scoring session — one compact strip: the category, the four facts
+            the Scorer checks at a glance, and the player count. */}
+        <div className="rounded-2xl border px-4 py-3 sm:px-5 flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-6 bg-surface border-line">
+          <div className="flex items-center justify-between gap-4 sm:block sm:flex-shrink-0">
+            <div>
+              <p className="type-tag text-accent-fg">Scoring Session</p>
+              <h2 className="text-lg sm:text-xl font-black text-ink leading-tight">{selectedGender.label} — {selectedAgeGroup.label}</h2>
+            </div>
+            {/* Count on the right of the title on a phone… */}
+            <p className="sm:hidden flex items-baseline gap-1.5">
+              <span className="text-2xl font-black text-accent-fg">{players.length}</span>
+              <span className="text-[10px] uppercase tracking-widest text-fg-muted">Players</span>
+            </p>
+          </div>
+
+          <div className="hidden sm:block w-px self-stretch bg-ink/10" aria-hidden="true" />
+
+          <dl className="flex flex-wrap gap-x-6 gap-y-2 flex-1 min-w-0">
+            {[
+              ['Team', selectedTeam.name],
+              ['Coach', selectedTeam.coach?.name],
+              ['Competition', selectedCompetitionType?.label],
+              ['Apparatus', seatApparatus],
+            ].filter(([, value]) => value).map(([label, value]) => (
+              <div key={label} className="min-w-0">
+                <dt className="text-[10px] uppercase tracking-widest text-fg-muted">{label}</dt>
+                <dd className="text-sm font-semibold text-ink truncate">{value}</dd>
+              </div>
+            ))}
+          </dl>
+
+          {/* …and at the far end on a wide screen. */}
+          <p className="hidden sm:flex flex-col items-end flex-shrink-0 leading-none">
+            <span className="text-3xl font-black text-accent-fg">{players.length}</span>
+            <span className="text-[10px] uppercase tracking-widest text-fg-muted mt-1">Players</span>
+          </p>
+        </div>
+
+        {/* <div className="rounded-2xl border p-4 bg-surface-sunken border-line">
+          <p className="type-tag mb-2 text-fg-secondary">Scoring System</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-fg-muted">
+            <p><span className="text-ink/70 font-semibold">Execution Average:</span> From J1–J4. With 4 judges, highest and lowest excluded.</p>
+            <p><span className="text-ink/70 font-semibold">Base Score:</span> If diff exceeds tolerance, Base = (Exec + Senior) / 2</p>
+            <p><span className="text-ink/70 font-semibold">Tolerance:</span> 9.00–9.99: 0.10 · 8.00–8.99: 0.20 · 7.00–7.99: 0.30 · 6.00–6.99: 0.40 · 5.00–5.99: 0.50 · Below 4.99: 1.00</p>
+            <p><span className="text-ink/70 font-semibold">Final Score:</span> Avg Marks − Time Deduction − Other Deduction</p>
+          </div>
+        </div> */}
+
+        {/* Every athlete with a tolerance hit, each re-opening its popup. */}
+        {toleranceHits.length > 0 && (
+          <div className="space-y-2" role="status" aria-live="polite">
+            {toleranceHits.map((hit) => (
+              <button key={hit.key} type="button" onClick={() => setReopenToleranceKey(hit.key)}
+                className="w-full flex items-center justify-between gap-3 p-3.5 rounded-xl border text-left"
+                style={{ background: 'rgb(var(--warning-fg) / 0.09)', borderColor: 'rgb(var(--warning-fg) / 0.35)' }}>
+                <span className="flex items-center gap-2.5 min-w-0">
+                  <AlertTriangle className="w-4 h-4 flex-shrink-0 text-warning-fg" aria-hidden="true" />
+                  <span className="text-sm font-bold text-ink truncate">
+                    Tolerance exceeded — {hit.name}: gap {Number(hit.analysis.toleranceInfo?.difference ?? 0).toFixed(2)} over ±{Number(hit.analysis.toleranceInfo?.tolerance ?? 0).toFixed(2)}
+                  </span>
+                </span>
+                <span className="text-xs font-bold flex-shrink-0 text-warning-fg">View</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {players.length > 0 ? (
+          <div className="rounded-2xl border p-6 bg-surface border-line">
+            <p className="type-tag mb-4 flex items-center gap-2 text-accent-fg">
+              <Clock className="w-3.5 h-3.5" /> Player Scoring {isLocked && <Eye className="w-3.5 h-3.5 text-ink/30" />}
+            </p>
+            {/* `judges` sizes the panel, `sheetSeats` draws it — they differ by
+                the Chief's copy on a 4-judge panel, and the size is what picks
+                the averaging rule. */}
+            <ResponsiveScoringTable players={tableRows} scores={scores} judges={sheetSeats} panelSize={seatedPanelSize} onScoreChange={handleScoreChange} isLocked={readOnly}
+              editableFields={SCORER_EDITABLE_FIELDS} lockedRows={timeLocks} onToggleRowLock={toggleTimeLock}
+              onMarkAbsent={(row) => setAbsentTarget(row)} canMarkAbsent={canMarkAbsent} />
+          </div>
+        ) : (
+          <div className="rounded-2xl border p-8 text-center bg-surface border-line">
+            <p className="text-fg-muted">No players found for this category.</p>
+          </div>
+        )}
+
+        <div className="rounded-2xl border p-6 bg-surface border-line">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            {[{ label: 'Time Keeper', value: timeKeeper, setter: setTimeKeeper, placeholder: 'Enter time keeper name', required: true },
+            { label: 'Scorer', value: scorer, setter: setScorer, placeholder: judgeInfo?.name || 'Enter scorer name', required: true },
+            { label: 'Remarks', value: remarks, setter: setRemarks, placeholder: 'Enter any remarks', required: false }].map(({ label, value, setter, placeholder, required }) => {
+              // Tie each label to its field. Without `htmlFor` these read as
+              // three unlabelled text boxes to a screen reader — and the page
+              // already has text inputs of its own in the score table, so
+              // "the box next to Time Keeper" is not something anything can
+              // work out from the markup alone.
+              const fieldId = `scorer-${label.toLowerCase().replace(/\s+/g, '-')}`;
+              return (
+              <div key={label}>
+                <label htmlFor={fieldId} className="block type-tag mb-2 text-accent-fg">
+                  {label}
+                  {required && <span className="text-red-700 dark:text-red-500 ml-1">*</span>}
+                </label>
+                <input id={fieldId} type="text" value={value} onChange={(e) => setter(e.target.value)} disabled={readOnly} placeholder={placeholder} className={darkInput} style={darkInputStyle(readOnly)}
+                  onFocus={(e) => { if (!readOnly) { e.target.style.borderColor = `${alpha('rgb(var(--accent))', 0x50)}`; e.target.style.boxShadow = `0 0 0 3px ${alpha('rgb(var(--accent))', 0x12)}`; } }}
+                  onBlur={(e) => { e.target.style.borderColor = 'var(--line-strong)'; e.target.style.boxShadow = 'none'; }} />
+              </div>
+              );
+            })}
+          </div>
+          <div className="flex justify-end">
+            {!readOnly ? (
+              <div className="flex flex-col items-end gap-2">
+                {seniorJudgeWaiting.length > 0 && (
+                  <p className="type-body-s text-fg-muted m-0 text-right" data-testid="scorer-awaiting-senior">
+                    Lock &amp; Submit opens once the Senior Judge has marked every athlete
+                    ({seniorJudgeWaiting.length} still to mark: {seniorJudgeWaiting.join(', ')}).
+                  </p>
+                )}
+                <button onClick={handleSaveScores} className="flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm text-ink min-h-[48px]" style={{ background: 'rgb(var(--success-fill))', color: 'rgb(var(--success-on))' }}>
+                  <Save className="w-4 h-4" /> {seniorJudgeWaiting.length > 0 ? 'Save Draft' : 'Save & Lock Scores'}
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-sm text-fg-muted">
+                <Lock className="w-4 h-4" />
+                {isLocked ? 'Scores are saved and locked' : 'This competition has closed'}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <ToleranceModal
+        isOpen={!!shownToleranceHit}
+        onClose={closeTolerance}
+        panelMismatch={shownToleranceHit?.analysis || {}}
+        panelScores={shownToleranceHit?.panel || {}}
+        isSeniorJudge={false}
+        judgeNameMap={judgeNameMap}
+        viewer="scorer"
+        athleteName={shownToleranceHit?.name}
+      />
+
+      <ConfirmDialog
+        isOpen={Boolean(absentTarget)}
+        onClose={() => setAbsentTarget(null)}
+        onConfirm={markAbsent}
+        title={`Mark ${absentTarget?.name || 'this athlete'} absent?`}
+        message={'Every judge\'s score, the time and every deduction are saved as 0, and the final score is 0.00.\nThe athlete is locked for the whole panel; only the admin can reopen them.'}
+        confirmText="Mark Absent"
+        cancelText="Cancel"
+        variant="danger"
+      />
+
+      <ConfirmDialog
+        isOpen={showConfirmDialog}
+        onClose={() => setShowConfirmDialog(false)}
+        onConfirm={handleConfirmSave}
+        title={confirmDialogConfig.title}
+        message={confirmDialogConfig.message}
+        confirmText={confirmDialogConfig.shouldLock ? 'Lock & Submit' : 'Save Draft'}
+        cancelText="Cancel"
+        variant={confirmDialogConfig.shouldLock ? 'danger' : 'default'}
+      />
+    </div>
+  );
+};
+
+export default ScorerScoring;

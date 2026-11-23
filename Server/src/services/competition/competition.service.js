@@ -1,0 +1,806 @@
+/**
+ * Competition Service
+ * 
+ * Handles competition management operations including CRUD operations,
+ * status management, and competition queries.
+ * 
+ * Requirements: 1.5, 1.7, 1.8
+ */
+
+const { 
+  ValidationError, 
+  ConflictError, 
+  NotFoundError,
+  BusinessRuleError 
+} = require('../../errors');
+const { sanitizeCompetitionData } = require('../../utils/validation/sanitization.util');
+const { applyApparatusByGender } = require('../../utils/data/competition-apparatus.util');
+const { applyAgeGroups } = require('../../utils/data/custom-age-groups.util');
+const EventTypes = require('../../socket/events/event-types');
+const { pageMeta } = require('../../utils/data/pagination.util');
+
+/**
+ * Fee-window fields a plain admin may not set.
+ *
+ * These decide how much money a coach is charged and until when, so they are a
+ * SUPER ADMIN decision — set through `/api/superadmin/competitions`, which is
+ * behind `requireSuperAdmin`. This service backs `/api/competitions`, which any
+ * admin can reach, so the fields are dropped here rather than merely hidden in
+ * the UI: an admin who posts them directly gets a competition without them, not
+ * a competition priced by whoever asked last.
+ */
+// customAgeGroups: only the Super Admin defines a meet's own age groups (owner,
+// 2026-11-15); an admin may still switch the defined ones on and off.
+const SUPERADMIN_ONLY_FEE_FIELDS = ['registrationOpenDate', 'feeDueDate', 'lateFee', 'customAgeGroups'];
+
+/**
+ * @param {Object} data
+ * @returns {Object} a copy with the super-admin-only fee fields removed
+ */
+function stripSuperAdminFeeFields(data) {
+  if (!data || typeof data !== 'object') return data;
+  const stripped = { ...data };
+  for (const field of SUPERADMIN_ONLY_FEE_FIELDS) delete stripped[field];
+  return stripped;
+}
+
+class CompetitionService {
+  /**
+   * Create a competition service
+   * @param {CompetitionRepository} competitionRepository - Competition repository
+   * @param {CacheService} cacheService - Cache service
+   * @param {SocketManager} socketManager - Socket.IO manager (optional)
+   * @param {Logger} logger - Logger instance
+   * @param {AdminRepository} adminRepository - For the bidirectional cleanup on delete
+   */
+  constructor(competitionRepository, cacheService, socketManager, logger, adminRepository) {
+    this.competitionRepository = competitionRepository;
+    this.cacheService = cacheService;
+    this.socketManager = socketManager;
+    this.logger = logger;
+    this.adminRepository = adminRepository;
+  }
+
+  /**
+   * Cache wrap helper — falls back to get/set if cacheService.wrap is not available
+   */
+  async _cacheWrap(key, fn, ttl) {
+    if (this.cacheService && typeof this.cacheService.wrap === 'function') {
+      return this.cacheService.wrap(key, fn, ttl);
+    }
+    // Fall back to get/set pattern
+    if (this.cacheService && typeof this.cacheService.get === 'function') {
+      const cached = this.cacheService.get(key);
+      if (cached !== null && cached !== undefined) {
+        return cached;
+      }
+      const result = await fn();
+      if (typeof this.cacheService.set === 'function') {
+        this.cacheService.set(key, result, ttl);
+      }
+      return result;
+    }
+    return fn();
+  }
+
+  /**
+   * Create a new competition
+   * @param {Object} competitionData - Competition data
+   * @param {string} createdBy - Admin ID creating the competition
+   * @returns {Promise<Object>} Created competition
+   * @throws {ValidationError} If validation fails
+   * @throws {ConflictError} If competition already exists
+   */
+  async createCompetition(competitionData, createdBy) {
+    try {
+      // Sanitize string inputs
+      const sanitizedData = applyAgeGroups(applyApparatusByGender(
+        stripSuperAdminFeeFields(sanitizeCompetitionData(competitionData))
+      ));
+
+      // Validate dates
+      this.validateDates(sanitizedData.startDate, sanitizedData.endDate);
+
+      // Check for duplicate competition (same name, year, place)
+      const existing = await this.competitionRepository.findOne({
+        name: sanitizedData.name,
+        year: sanitizedData.year,
+        place: sanitizedData.place,
+        isDeleted: false
+      });
+
+      if (existing) {
+        this.logger.warn('Competition creation failed: Duplicate competition', {
+          name: sanitizedData.name,
+          year: sanitizedData.year,
+          place: sanitizedData.place
+        });
+        throw new ConflictError('Competition with same name, year, and place already exists');
+      }
+
+      // Set initial status based on start date
+      const status = this.determineStatus(sanitizedData.startDate, sanitizedData.endDate);
+
+      // Create competition
+      const competition = await this.competitionRepository.create({
+        ...sanitizedData,
+        status,
+        createdBy,
+        admins: [createdBy],
+        registeredTeams: [],
+        isDeleted: false
+      });
+
+      // Invalidate cache - clear all competition-related caches
+      this.cacheService.deletePattern('competitions:*');
+
+      this.logger.info('Competition created', {
+        competitionId: competition._id,
+        name: competition.name,
+        createdBy
+      });
+
+      // Emit Socket.IO event for real-time competition creation
+      if (this.socketManager) {
+        this.socketManager.broadcast(EventTypes.COMPETITION_CREATED, {
+          competitionId: competition._id,
+          name: competition.name,
+          status: competition.status,
+          startDate: competition.startDate,
+          endDate: competition.endDate,
+          timestamp: new Date()
+        });
+      }
+
+      return competition;
+    } catch (error) {
+      if (error instanceof ConflictError || error instanceof ValidationError) {
+        throw error;
+      }
+      this.logger.error('Create competition error', {
+        competitionData,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Update competition
+   * @param {string} competitionId - Competition ID
+   * @param {Object} updates - Update data
+   * @returns {Promise<Object>} Updated competition
+   * @throws {NotFoundError} If competition not found
+   * @throws {ValidationError} If validation fails
+   */
+  async updateCompetition(competitionId, updates) {
+    try {
+      // Sanitize string inputs
+      // Find competition
+      const competition = await this.competitionRepository.findById(competitionId);
+
+      if (!competition || competition.isDeleted) {
+        this.logger.warn('Competition update failed: Not found', { competitionId });
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      const sanitizedUpdates = applyAgeGroups(applyApparatusByGender(
+        stripSuperAdminFeeFields(sanitizeCompetitionData(updates)),
+        competition.competitionTypes
+      ), competition);
+
+      // Validate dates if being updated
+      if (sanitizedUpdates.startDate || sanitizedUpdates.endDate) {
+        const startDate = sanitizedUpdates.startDate || competition.startDate;
+        const endDate = sanitizedUpdates.endDate || competition.endDate;
+        this.validateDates(startDate, endDate);
+      }
+
+      // Don't allow updating certain fields
+      const { _id, createdBy, registeredTeams, isDeleted, ...allowedUpdates } = sanitizedUpdates;
+
+      // Update competition
+      const updated = await this.competitionRepository.updateById(competitionId, allowedUpdates);
+
+      // Invalidate cache - clear all competition-related caches
+      this.cacheService.delete(`competition:${competitionId}`);
+      this.cacheService.deletePattern('competitions:*');
+
+      this.logger.info('Competition updated', {
+        competitionId,
+        updates: Object.keys(allowedUpdates)
+      });
+
+      // Emit Socket.IO event for real-time competition update
+      if (this.socketManager) {
+        this.socketManager.emitToRoom(
+          `competition_${competitionId}`,
+          EventTypes.COMPETITION_UPDATED,
+          {
+            competitionId,
+            updates: allowedUpdates,
+            timestamp: new Date()
+          }
+        );
+      }
+
+      return updated;
+    } catch (error) {
+      if (error instanceof NotFoundError || error instanceof ValidationError) {
+        throw error;
+      }
+      this.logger.error('Update competition error', {
+        competitionId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Delete competition (soft delete)
+   * @param {string} competitionId - Competition ID
+   * @returns {Promise<boolean>} True if deleted
+   * @throws {NotFoundError} If competition not found
+   * @throws {BusinessRuleError} If competition has started
+   */
+  async deleteCompetition(competitionId) {
+    try {
+      // Find competition
+      const competition = await this.competitionRepository.findById(competitionId);
+
+      if (!competition || competition.isDeleted) {
+        this.logger.warn('Competition delete failed: Not found', { competitionId });
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      // Don't allow deleting ongoing or completed competitions
+      if (competition.status === 'ongoing' || competition.status === 'completed') {
+        this.logger.warn('Competition delete failed: Competition has started', {
+          competitionId,
+          status: competition.status
+        });
+        throw new BusinessRuleError(
+          'Cannot delete competition that has started or completed',
+          { status: competition.status }
+        );
+      }
+
+      // Soft delete
+      const updated = await this.competitionRepository.updateById(competitionId, { isDeleted: true });
+      if (!updated) {
+        this.logger.warn('Competition delete failed: update matched no document', { competitionId });
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      // Remove this competition from every admin's assignments (bidirectional cleanup)
+      await this.adminRepository.removeCompetitionFromAll(competitionId);
+
+      // Invalidate cache - clear all competition-related caches
+      this.cacheService.delete(`competition:${competitionId}`);
+      this.cacheService.deletePattern('competitions:*');
+
+      this.logger.info('Competition deleted', { competitionId });
+
+      return true;
+    } catch (error) {
+      if (error instanceof NotFoundError || error instanceof BusinessRuleError) {
+        throw error;
+      }
+      this.logger.error('Delete competition error', {
+        competitionId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Assign an admin to a competition (bidirectional: competition.admins AND
+   * admin.competitions both get the link, mirroring
+   * SuperAdminService.assignAdminToCompetition).
+   * @param {string} competitionId - Competition ID
+   * @param {string} adminId - Admin ID
+   * @returns {Promise<Object>} Updated competition, admins populated
+   * @throws {NotFoundError} If the competition or admin doesn't exist
+   */
+  async assignAdmin(competitionId, adminId) {
+    try {
+      const competition = await this.competitionRepository.findById(competitionId);
+      if (!competition || competition.isDeleted) {
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      const admin = await this.adminRepository.findById(adminId);
+      if (!admin) {
+        throw new NotFoundError('Admin', adminId);
+      }
+
+      const admins = Array.from(new Set([...(competition.admins || []).map(String), String(adminId)]));
+      await this.competitionRepository.updateById(competitionId, { admins });
+
+      const adminCompetitions = Array.from(new Set([...(admin.competitions || []).map(String), String(competitionId)]));
+      await this.adminRepository.updateById(adminId, { competitions: adminCompetitions });
+
+      this.cacheService.delete(`competition:${competitionId}`);
+      this.cacheService.deletePattern('competitions:*');
+
+      this.logger.info('Admin assigned to competition', { competitionId, adminId });
+
+      return this.competitionRepository.findById(competitionId, {
+        populate: { path: 'admins', select: 'name email role isActive' }
+      });
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        throw error;
+      }
+      this.logger.error('Assign admin error', { competitionId, adminId, error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Remove an admin from a competition (bidirectional cleanup — the inverse
+   * of assignAdmin).
+   * @param {string} competitionId - Competition ID
+   * @param {string} adminId - Admin ID
+   * @returns {Promise<Object>} Updated competition, admins populated
+   * @throws {NotFoundError} If the competition doesn't exist
+   */
+  async removeAdmin(competitionId, adminId) {
+    try {
+      const competition = await this.competitionRepository.findById(competitionId);
+      if (!competition || competition.isDeleted) {
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      const admins = (competition.admins || []).map(String).filter((v) => v !== String(adminId));
+      await this.competitionRepository.updateById(competitionId, { admins });
+
+      const admin = await this.adminRepository.findById(adminId);
+      if (admin) {
+        const adminCompetitions = (admin.competitions || []).map(String).filter((v) => v !== String(competitionId));
+        await this.adminRepository.updateById(adminId, { competitions: adminCompetitions });
+      }
+
+      this.cacheService.delete(`competition:${competitionId}`);
+      this.cacheService.deletePattern('competitions:*');
+
+      this.logger.info('Admin removed from competition', { competitionId, adminId });
+
+      return this.competitionRepository.findById(competitionId, {
+        populate: { path: 'admins', select: 'name email role isActive' }
+      });
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        throw error;
+      }
+      this.logger.error('Remove admin error', { competitionId, adminId, error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Get competition by ID
+   * @param {string} competitionId - Competition ID
+   * @returns {Promise<Object>} Competition
+   * @throws {NotFoundError} If competition not found
+   */
+  async getCompetitionById(competitionId, options = {}) {
+    /*
+     * The entry list is OPT-IN.
+     *
+     * `registeredTeams` embeds every entered team and every athlete in every
+     * entry, so this endpoint returned 3.0 MB on a 1000-team fixture — to a
+     * caller that usually wants a name, a date and a status. Worse, the whole
+     * 3 MB was then held in the in-process cache for five minutes.
+     *
+     * Callers that genuinely need the roster ask for it with
+     * `?include=registeredTeams`. Nothing in the web client calls this endpoint
+     * at all (admins use /api/admin/*, superadmins /api/superadmin/*), so the
+     * narrower default breaks no shipped caller.
+     */
+    const includeRegisteredTeams = options.includeRegisteredTeams === true;
+
+    try {
+      // The variants must not share a cache entry, or whichever ran first
+      // decides what the other one gets.
+      const cacheKey = `competition:${competitionId}${includeRegisteredTeams ? ':full' : ''}`;
+      const cached = this.cacheService.get(cacheKey);
+
+      if (cached) {
+        return cached;
+      }
+
+      // Fetch from database
+      const competition = await this.competitionRepository.findById(competitionId, {
+        ...(includeRegisteredTeams ? {} : { select: '-registeredTeams' }),
+        populate: includeRegisteredTeams
+          ? [
+            { path: 'admins', select: 'name email' },
+            { path: 'registeredTeams.team', select: 'name' },
+            { path: 'registeredTeams.coach', select: 'name email' }
+          ]
+          : [{ path: 'admins', select: 'name email' }]
+      });
+
+      if (!competition || competition.isDeleted) {
+        this.logger.warn('Competition not found', { competitionId });
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      // Cache result
+      this.cacheService.set(cacheKey, competition, 300); // 5 minutes
+
+      return competition;
+    } catch (error) {
+      if (error instanceof NotFoundError) {
+        throw error;
+      }
+      this.logger.error('Get competition error', {
+        competitionId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Get competitions with filtering and pagination
+   * @param {Object} filters - Filter criteria
+   * @param {Object} options - Query options (page, limit, sort)
+   * @returns {Promise<Object>} { competitions, total, page, pages }
+   */
+  async getCompetitions(filters = {}, options = {}) {
+    try {
+      const {
+        status,
+        level,
+        year,
+        competitionType,
+        search
+      } = filters;
+
+      const {
+        page = 1,
+        limit = 10,
+        sort = { startDate: -1 }
+      } = options;
+
+      // Build query criteria
+      const criteria = { isDeleted: false };
+
+      if (status) {
+        criteria.status = status;
+      }
+
+      if (level) {
+        criteria.level = level;
+      }
+
+      if (year) {
+        criteria.year = parseInt(year);
+      }
+
+      if (competitionType) {
+        criteria.competitionTypes = competitionType;
+      }
+
+      if (search) {
+        // A literal substring match: the term is escaped and capped, so a
+        // caller cannot hand MongoDB a pattern to run (security audit
+        // 2026-10-31, L4). Behaviour for ordinary words is unchanged.
+        const term = String(search).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        criteria.$or = [
+          { name: { $regex: term, $options: 'i' } },
+          { place: { $regex: term, $options: 'i' } }
+        ];
+      }
+
+      // Try cache with wrap method
+      const cacheKey = `competitions:list:${JSON.stringify({ criteria, page, limit, sort })}`;
+      
+      return await this._cacheWrap(cacheKey, async () => {
+        // Calculate pagination
+        const skip = (page - 1) * limit;
+
+        // Fetch competitions and count
+        const [competitions, total] = await Promise.all([
+          this.competitionRepository.find(criteria, {
+            skip,
+            limit,
+            sort,
+            populate: [
+              { path: 'admins', select: 'name email' }
+            ]
+          }),
+          this.competitionRepository.count(criteria)
+        ]);
+
+        const result = { competitions, ...pageMeta(total, page, limit) };
+
+        this.logger.debug('Competitions fetched from database', {
+          filters,
+          total,
+          page
+        });
+
+        return result;
+      }, 300); // 5 minutes TTL
+    } catch (error) {
+      this.logger.error('Get competitions error', {
+        filters,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Update competition status
+   * @param {string} competitionId - Competition ID
+   * @param {string} newStatus - New status (upcoming, ongoing, completed)
+   * @returns {Promise<Object>} Updated competition
+   * @throws {NotFoundError} If competition not found
+   * @throws {BusinessRuleError} If status transition is invalid
+   */
+  async updateCompetitionStatus(competitionId, newStatus) {
+    try {
+      // Validate status
+      const validStatuses = ['upcoming', 'ongoing', 'completed'];
+      if (!validStatuses.includes(newStatus)) {
+        throw new ValidationError('Invalid status', {
+          status: newStatus,
+          validStatuses
+        });
+      }
+
+      // Find competition
+      const competition = await this.competitionRepository.findById(competitionId);
+
+      if (!competition || competition.isDeleted) {
+        this.logger.warn('Competition status update failed: Not found', { competitionId });
+        throw new NotFoundError('Competition', competitionId);
+      }
+
+      // Validate status transition based on dates
+      this.validateStatusTransition(competition, newStatus);
+
+      // Update status
+      const updated = await this.competitionRepository.updateById(competitionId, {
+        status: newStatus
+      });
+
+      // Invalidate cache - clear all competition-related caches
+      this.cacheService.delete(`competition:${competitionId}`);
+      this.cacheService.deletePattern('competitions:*');
+
+      this.logger.info('Competition status updated', {
+        competitionId,
+        oldStatus: competition.status,
+        newStatus
+      });
+
+      // Emit Socket.IO event for real-time status update
+      if (this.socketManager) {
+        this.socketManager.emitToRoom(
+          `competition_${competitionId}`,
+          EventTypes.COMPETITION_STATUS_UPDATED,
+          {
+            competitionId,
+            oldStatus: competition.status,
+            newStatus,
+            timestamp: new Date()
+          }
+        );
+      }
+
+      return updated;
+    } catch (error) {
+      if (error instanceof NotFoundError || 
+          error instanceof ValidationError || 
+          error instanceof BusinessRuleError) {
+        throw error;
+      }
+      this.logger.error('Update competition status error', {
+        competitionId,
+        newStatus,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Get upcoming competitions
+   * @param {Object} options - Query options
+   * @returns {Promise<Array>} Upcoming competitions
+   */
+  async getUpcomingCompetitions(options = {}) {
+    try {
+      const { limit = 10 } = options;
+
+      // Cache upcoming competitions
+      const cacheKey = `competitions:upcoming:${limit}`;
+      
+      return await this._cacheWrap(cacheKey, async () => {
+        const competitions = await this.competitionRepository.findUpcoming({
+          limit,
+          populate: [{ path: 'admins', select: 'name email' }]
+        });
+
+        this.logger.debug('Upcoming competitions fetched from database', {
+          count: competitions.length
+        });
+
+        return competitions;
+      }, 300); // 5 minutes TTL
+    } catch (error) {
+      this.logger.error('Get upcoming competitions error', {
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Get active competitions (ongoing)
+   * @param {Object} options - Query options
+   * @returns {Promise<Array>} Active competitions
+   */
+  async getActiveCompetitions(options = {}) {
+    try {
+      const { limit = 50 } = options;
+
+      // Cache active competitions with shorter TTL since they're frequently accessed
+      const cacheKey = `competitions:active:${limit}`;
+      
+      return await this._cacheWrap(cacheKey, async () => {
+        const competitions = await this.competitionRepository.findByStatus('ongoing', {
+          limit,
+          populate: [{ path: 'admins', select: 'name email' }]
+        });
+
+        this.logger.debug('Active competitions fetched from database', {
+          count: competitions.length
+        });
+
+        return competitions;
+      }, 180); // 3 minutes TTL (shorter for active competitions)
+    } catch (error) {
+      this.logger.error('Get active competitions error', {
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Get competitions by status
+   * @param {string} status - Competition status
+   * @param {Object} options - Query options
+   * @returns {Promise<Array>} Competitions
+   */
+  async getCompetitionsByStatus(status, options = {}) {
+    try {
+      const competitions = await this.competitionRepository.findByStatus(status, options);
+      return competitions;
+    } catch (error) {
+      this.logger.error('Get competitions by status error', {
+        status,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Get open competitions (upcoming and ongoing) available for registration
+   * Used by coaches and players to see which competitions they can join
+   * @returns {Promise<Array>} Open competitions
+   */
+  async getOpenCompetitions() {
+    try {
+      // Cache open competitions
+      const cacheKey = 'competitions:open';
+      
+      return await this._cacheWrap(cacheKey, async () => {
+        // Get competitions that are upcoming or ongoing
+        const competitions = await this.competitionRepository.find(
+          {
+            isDeleted: false,
+            status: { $in: ['upcoming', 'ongoing'] }
+          },
+          {
+            sort: { startDate: 1 }, // Sort by start date ascending
+            populate: [{ path: 'admins', select: 'name email' }]
+          }
+        );
+
+        this.logger.debug('Open competitions fetched from database', {
+          count: competitions.length
+        });
+
+        return competitions;
+      }, 300); // 5 minutes TTL
+    } catch (error) {
+      this.logger.error('Get open competitions error', {
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Validate dates
+   * @param {Date} startDate - Start date
+   * @param {Date} endDate - End date
+   * @throws {ValidationError} If dates are invalid
+   */
+  validateDates(startDate, endDate) {
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+
+    if (isNaN(start.getTime())) {
+      throw new ValidationError('Invalid start date');
+    }
+
+    if (isNaN(end.getTime())) {
+      throw new ValidationError('Invalid end date');
+    }
+
+    if (end < start) {
+      throw new ValidationError('End date cannot be before start date');
+    }
+  }
+
+  /**
+   * Determine competition status based on dates
+   * @param {Date} startDate - Start date
+   * @param {Date} endDate - End date
+   * @returns {string} Status (upcoming, ongoing, completed)
+   */
+  determineStatus(startDate, endDate) {
+    const now = new Date();
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+
+    if (now < start) {
+      return 'upcoming';
+    } else if (now >= start && now <= end) {
+      return 'ongoing';
+    } else {
+      return 'completed';
+    }
+  }
+
+  /**
+   * Validate status transition
+   * @param {Object} competition - Competition object
+   * @param {string} newStatus - New status
+   * @throws {BusinessRuleError} If transition is invalid
+   */
+  validateStatusTransition(competition, newStatus) {
+    const now = new Date();
+    const startDate = new Date(competition.startDate);
+    const endDate = new Date(competition.endDate);
+
+    if (newStatus === 'ongoing') {
+      if (now < startDate) {
+        throw new BusinessRuleError(
+          'Cannot set status to ongoing before start date',
+          { startDate: competition.startDate }
+        );
+      }
+    } else if (newStatus === 'completed') {
+      if (now <= endDate) {
+        throw new BusinessRuleError(
+          'Cannot set status to completed before end date',
+          { endDate: competition.endDate }
+        );
+      }
+    }
+  }
+}
+
+module.exports = CompetitionService;

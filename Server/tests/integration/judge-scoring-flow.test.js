@@ -1,0 +1,535 @@
+/**
+ * End-to-end integration test for the judge scoring flow (audit task 3.5).
+ *
+ * `tests/integration/` previously held only a README. The `tests/security/`
+ * suites exercise individual findings well, but they each set up one narrow
+ * situation. This walks the whole competition sequence a panel actually
+ * performs, in order, so a regression that only appears *between* steps —
+ * a slip lost when the second judge submits, a lock that does not hold, a
+ * recalculation that drops a category — has somewhere to show up.
+ *
+ * Real router, real auth middleware, real controller, real services, real
+ * repositories and real Mongoose models on an in-memory MongoDB. Only the
+ * token service is stubbed, so a test can mint an identity without signing a
+ * JWT, and the two sibling controllers the public router resolves but never
+ * exercises.
+ */
+
+const express = require('express');
+const request = require('supertest');
+const mongoose = require('mongoose');
+
+const createPublicRoutes = require('../../src/routes/public.routes');
+const createAdminController = require('../../src/controllers/admin.controller');
+const AdminService = require('../../src/services/user/admin.service');
+const ScoringService = require('../../src/services/scoring/scoring.service');
+const CalculationService = require('../../src/services/scoring/calculation.service');
+const JudgeRepository = require('../../src/repositories/judge.repository');
+const JudgeAccountRepository = require('../../src/repositories/judge-account.repository');
+const ScoreRepository = require('../../src/repositories/score.repository');
+const AdminRepository = require('../../src/repositories/admin.repository');
+const CompetitionRepository = require('../../src/repositories/competition.repository');
+const { errorHandler } = require('../../src/middleware/error.middleware');
+
+const Judge = require('../../src/models/Judge');
+const JudgeAccount = require('../../src/models/JudgeAccount');
+const Competition = require('../../src/models/Competition');
+const Score = require('../../src/models/Score');
+
+const noopLogger = { debug() {}, info() {}, warn() {}, error() {} };
+
+const issuedTokens = new Map();
+
+/**
+ * Mint a bearer token for a persisted principal.
+ *
+ * For a judge the principal is the ACCOUNT, so this accepts the
+ * `{ judge, account }` pair createJudge returns as well as a bare document.
+ */
+function tokenFor(doc, userType = 'judge') {
+  const principal = doc?.account || doc;
+  const value = `test-token-${principal._id}`;
+  issuedTokens.set(value, { userId: String(principal._id), userType });
+  return value;
+}
+
+function buildApp() {
+  const judgeRepository = new JudgeRepository(noopLogger);
+  const judgeAccountRepository = new JudgeAccountRepository(noopLogger);
+  const scoreRepository = new ScoreRepository(noopLogger);
+  const adminRepository = new AdminRepository(noopLogger);
+  const calculationService = new CalculationService(noopLogger);
+  // Real repository: lockScoresForAgeGroup resolves the competition before
+  // locking, so a stub would only prove the stub.
+  const competitionRepository = new CompetitionRepository(noopLogger);
+
+  const scoringService = new ScoringService(
+    scoreRepository,
+    competitionRepository,
+    null,
+    judgeRepository,
+    null,
+    noopLogger,
+    calculationService
+  );
+
+  const adminService = new AdminService({
+    adminRepository,
+    judgeRepository,
+    judgeAccountRepository,
+    scoreRepository,
+    calculationService,
+    scoringService,
+    logger: noopLogger,
+  });
+
+  const container = {
+    resolve: (key) => {
+      switch (key) {
+        case 'adminService':
+          return adminService;
+        case 'scoringService':
+          return scoringService;
+        case 'logger':
+          return noopLogger;
+        case 'config':
+          return { get: () => 'test' };
+        case 'tokenService':
+          return {
+            generateToken: () => 'stub-token',
+            verifyToken: (token) => {
+              const payload = issuedTokens.get(token);
+              if (!payload) {
+                const err = new Error('Token is not valid');
+                err.code = 'INVALID_TOKEN';
+                throw err;
+              }
+              return payload;
+            },
+          };
+        case 'judgeRepository':
+          return judgeRepository;
+        case 'authenticationService':
+          return { getRepositoryByType: () => judgeAccountRepository };
+        case 'adminController':
+          return createAdminController(container);
+        case 'publicController':
+        case 'paymentController':
+          return new Proxy({}, { get: () => (req, res) => res.json({ success: true }) });
+        default:
+          return {};
+      }
+    },
+  };
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api/public', createPublicRoutes(container));
+  app.use(errorHandler);
+  return { app, scoringService };
+}
+
+const { app, scoringService } = buildApp();
+
+const competitionId = new mongoose.Types.ObjectId();
+const teamId = new mongoose.Types.ObjectId();
+const playerId = new mongoose.Types.ObjectId();
+
+/** A registered judge (the person) seated on the Under14 Male panel. */
+async function createJudge({ judgeNo, judgeType, name, email }) {
+  const [firstName, ...rest] = name.split(' ');
+  const account = await JudgeAccount.create({
+    firstName,
+    lastName: rest.join(' ') || 'Judge',
+    email,
+    password: 'PlaintextSecret1',
+    isActive: true,
+  });
+
+  const judge = await Judge.create({
+    judgeAccount: account._id,
+    competition: competitionId,
+    competitionTypes: ['competition_1', 'competition_2'],
+    gender: 'Male',
+    ageGroup: 'Under14',
+    judgeNo,
+    judgeType,
+    isActive: true,
+  });
+
+  return { judge, account };
+}
+
+/** A slip as the judge UI shapes it. */
+const slip = (overrides = {}) => ({
+  competition: competitionId.toString(),
+  teamId: teamId.toString(),
+  gender: 'Male',
+  ageGroup: 'Under14',
+  competitionType: 'competition_1',
+  playerId: playerId.toString(),
+  playerName: 'Test Performer',
+  apparatus: 'Pole Mallakhamb',
+  score: 8.5,
+  breakdown: {
+    difficulty: { aClass: 4, bClass: 6, cClass: 1, total: 3.8 },
+    combination: { checked: {}, total: 1.6 },
+    execution: 3.1,
+    bonus: 0,
+  },
+  ...overrides,
+});
+
+const post = (auth, body) =>
+  request(app).post('/api/public/save-score').set('Authorization', `Bearer ${auth}`).send(body);
+
+describe('judge scoring flow — a full panel sequence', () => {
+  let senior;
+  let j1;
+  let j2;
+
+  beforeEach(async () => {
+    // The competition has to exist: the lock path resolves it first.
+    await Competition.create({
+      _id: competitionId,
+      name: 'Integration Meet',
+      place: 'Test Venue',
+      level: 'state',
+      year: 2026,
+      playerFee: 100,
+      startDate: new Date('2026-09-01T00:00:00.000Z'),
+      endDate: new Date('2026-09-03T00:00:00.000Z'),
+    });
+
+    senior = await createJudge({ judgeNo: 1, judgeType: 'Senior Judge', name: 'Senior One', email: 'sr1@club.in' });
+    j1 = await createJudge({ judgeNo: 2, judgeType: 'Judge 1', name: 'Judge One', email: 'j1@club.in' });
+    j2 = await createJudge({ judgeNo: 3, judgeType: 'Judge 2', name: 'Judge Two', email: 'j2@club.in' });
+  });
+
+  // User rule 2026-11-07: a judge's own slip needs Execution ≥ 0.10. The web
+  // slip locks Submit below that; this is the server half, so a request that
+  // goes around the screen is refused too.
+  test('refuses a slip with Execution below 0.10, accepts 0.10', async () => {
+    const withExecution = (execution) => slip({ breakdown: { ...slip().breakdown, execution } });
+
+    for (const execution of [0, 0.05]) {
+      const res = await post(tokenFor(j1), withExecution(execution));
+      expect(res.status).toBe(400);
+      expect(res.body.error.message).toMatch(/Execution must be at least 0\.10/);
+    }
+    const noBreakdown = await post(tokenFor(j1), slip({ breakdown: undefined }));
+    expect(noBreakdown.status).toBe(400);
+    expect(await Score.findOne({ teamId })).toBeNull();
+
+    // A Senior Judge may not write another judge's slip at all (2026-11-09).
+    const override = await post(tokenFor(senior), {
+      ...withExecution(0), judgeType: 'Judge 1', overrideBySenior: true,
+    });
+    expect(override.status).toBe(403);
+
+    expect((await post(tokenFor(j1), withExecution(0.1))).status).toBe(200);
+    const doc = await Score.findOne({ teamId, competition: competitionId });
+    expect(doc.playerScores[0].judgeSlips[0].executionScore).toBe(0.1);
+  });
+
+  // User rule 2026-11-15: the Senior Judge marks an athlete absent; nobody
+  // else on the panel may, and the server writes the whole row itself.
+  test('only the Senior Judge marks an athlete absent, and every value is 0', async () => {
+    const absentBody = { ...slip(), markAbsent: true, score: 9.9 };
+    const refused = await post(tokenFor(j1), absentBody);
+    expect(refused.status).toBe(403);
+    expect(await Score.findOne({ teamId })).toBeNull();
+
+    expect((await post(tokenFor(j1), slip({ score: 8.1 }))).status).toBe(200);
+    const res = await post(tokenFor(senior), absentBody);
+    expect(res.status).toBe(200);
+    const row = (await Score.findOne({ teamId, competition: competitionId })).playerScores[0];
+    expect(row).toMatchObject({ isAbsent: true, isFinalized: true, finalScore: 0, time: '0', deduction: 0 });
+    expect(row.judgeScores.judge1).toBe(0);
+    // Locked for the panel from now on.
+    expect((await post(tokenFor(j2), slip({ score: 7 }))).status).not.toBe(200);
+  });
+
+  // User rule 2026-11-16: the Scorer can mark an athlete absent too, from the
+  // sheet; the server writes the whole row, time 0, every judge 0.00.
+  test('the Scorer marks an athlete absent; every value is 0 for the whole panel', async () => {
+    const scorer = await createJudge({ judgeNo: 6, judgeType: 'Scorer', name: 'Score Keeper', email: 'sc@club.in' });
+    expect((await post(tokenFor(j1), slip({ score: 8.1 }))).status).toBe(200);
+
+    const res = await post(tokenFor(scorer), {
+      ...slip(), markAbsent: true, score: undefined, time: '1:20',
+    });
+    expect(res.status).toBe(200);
+    const row = (await Score.findOne({ teamId, competition: competitionId })).playerScores[0];
+    expect(row).toMatchObject({ isAbsent: true, isFinalized: true, finalScore: 0, time: '0', deduction: 0, otherDeduction: 0 });
+    expect(Object.values(row.judgeScores.toObject ? row.judgeScores.toObject() : row.judgeScores).every((v) => v === 0)).toBe(true);
+    // Locked for the panel from now on.
+    expect((await post(tokenFor(j2), slip({ score: 7 }))).status).not.toBe(200);
+  });
+
+  test('the Scorer cannot mark absent an athlete whose panel score is already final', async () => {
+    const scorer = await createJudge({ judgeNo: 6, judgeType: 'Scorer', name: 'Score Keeper', email: 'sc@club.in' });
+    expect((await post(tokenFor(j1), slip({ score: 8.1 }))).status).toBe(200);
+    expect((await post(tokenFor(j2), slip({ score: 8.3 }))).status).toBe(200);
+    expect((await post(tokenFor(senior), slip({ score: 8.2 }))).status).toBe(200);
+    expect((await post(tokenFor(senior), { ...slip({ score: 8.2 }), isFinalSubmit: true, panelSize: 3 })).status).toBe(200);
+
+    const res = await post(tokenFor(scorer), { ...slip(), markAbsent: true, score: undefined });
+    expect(res.status).toBe(400);
+    expect(res.body.error?.message || res.body.message).toMatch(/already final/);
+    const row = (await Score.findOne({ teamId, competition: competitionId })).playerScores[0];
+    expect(row.isAbsent).toBeFalsy();
+    expect(row.judgeScores.judge1).toBe(8.1);
+  });
+
+  // User rule 2026-11-08: the Scorer's sheet posts the whole panel back, but
+  // the server takes only the time from it — not the judges' marks, and not
+  // a body that claims the Scorer may write them.
+  test('a Scorer save keeps the judges\' marks and takes only the time', async () => {
+    const scorer = await createJudge({ judgeNo: 6, judgeType: 'Scorer', name: 'Score Keeper', email: 'sc@club.in' });
+    expect((await post(tokenFor(j1), slip({ score: 8.1 }))).status).toBe(200);
+
+    const res = await post(tokenFor(scorer), {
+      competition: competitionId.toString(),
+      teamId: teamId.toString(),
+      gender: 'Male',
+      ageGroup: 'Under14',
+      competitionType: 'competition_1',
+      timeKeeper: 'T. Keeper',
+      scorer: 'Score Keeper',
+      scorerTimeOnly: false,
+      playerScores: [{
+        playerId: playerId.toString(),
+        playerName: 'Test Performer',
+        apparatus: 'Pole Mallakhamb',
+        time: '1:35',
+        judgeScores: { judge1: 10, seniorJudge: 10 },
+        otherDeduction: 2,
+      }],
+    });
+    expect(res.status).toBe(200);
+
+    const performer = (await Score.findOne({ teamId, competition: competitionId })).playerScores[0];
+    expect(performer.judgeScores.judge1).toBe(8.1);
+    expect(performer.judgeScores.seniorJudge ?? 0).toBe(0);
+    expect(performer.time).toBe('1:35');
+    expect(performer.deduction).toBe(0.3);
+    // The Other Deduction is the Scorer's to set (user rule 2026-11-08).
+    expect(performer.otherDeduction).toBe(2);
+  });
+
+  test('auth → three slips → finalize → lock, end to end', async () => {
+    // --- 1. Anonymous submission is refused before anything exists. --------
+    const anon = await request(app).post('/api/public/save-score').send(slip());
+    expect(anon.status).toBe(401);
+    expect(await Score.findOne({ teamId })).toBeNull();
+
+    // --- 2. Each panel judge submits their own slip. ----------------------
+    expect((await post(tokenFor(j1), slip({ score: 8.1 }))).status).toBe(200);
+    expect((await post(tokenFor(j2), slip({ score: 8.3 }))).status).toBe(200);
+    expect((await post(tokenFor(senior), slip({ score: 8.2 }))).status).toBe(200);
+
+    let doc = await Score.findOne({ teamId, competition: competitionId });
+    let performer = doc.playerScores[0];
+
+    // All three landed in their own slots — none overwrote another.
+    expect(performer.judgeScores.judge1).toBe(8.1);
+    expect(performer.judgeScores.judge2).toBe(8.3);
+    expect(performer.judgeScores.seniorJudge).toBe(8.2);
+    expect(performer.judgeSlips.map((s) => s.judgeRole).sort()).toEqual(['J1', 'J2', 'SR_JUDGE']);
+
+    // --- 3. A non-senior cannot finalize. --------------------------------
+    const rejectedFinalize = await post(tokenFor(j1), slip({ score: 8.1, isFinalSubmit: true }));
+    expect(rejectedFinalize.status).toBe(403);
+
+    doc = await Score.findOne({ teamId, competition: competitionId });
+    expect(doc.playerScores[0].isFinalized).not.toBe(true);
+
+    // --- 4. The Senior Judge finalizes. ----------------------------------
+    const finalize = await post(tokenFor(senior), slip({ score: 8.2, isFinalSubmit: true }));
+    expect(finalize.status).toBe(200);
+
+    doc = await Score.findOne({ teamId, competition: competitionId });
+    performer = doc.playerScores[0];
+    expect(performer.isFinalized).toBe(true);
+    expect(performer.finalizedAt).toBeInstanceOf(Date);
+
+    // --- 5. A finalized performer rejects further judge edits. -----------
+    const afterFinalize = await post(tokenFor(j1), slip({ score: 9.9 }));
+    expect(afterFinalize.status).toBeGreaterThanOrEqual(400);
+
+    doc = await Score.findOne({ teamId, competition: competitionId });
+    expect(doc.playerScores[0].judgeScores.judge1).toBe(8.1);
+
+    // --- 6. An admin locks the document; nothing may write after that. ----
+    await scoringService.lockScoresForAgeGroup(competitionId, 'Under14', new mongoose.Types.ObjectId());
+
+    doc = await Score.findOne({ teamId, competition: competitionId });
+    expect(doc.isLocked).toBe(true);
+
+    const afterLock = await post(tokenFor(senior), slip({ score: 7.0 }));
+    expect(afterLock.status).toBeGreaterThanOrEqual(400);
+
+    doc = await Score.findOne({ teamId, competition: competitionId });
+    expect(doc.playerScores[0].judgeScores.seniorJudge).toBe(8.2);
+  });
+
+  test('a second category is scored independently of the first', async () => {
+    // HIGH-3 in the shape it actually occurs: the same team scored in two
+    // categories during one meet.
+    expect((await post(tokenFor(j1), slip({ competitionType: 'competition_1', score: 8.1 }))).status).toBe(200);
+    expect((await post(tokenFor(j1), slip({ competitionType: 'competition_2', score: 6.4 }))).status).toBe(200);
+
+    const docs = await Score.find({ teamId, competition: competitionId });
+    expect(docs).toHaveLength(2);
+
+    const byType = Object.fromEntries(docs.map((d) => [d.competitionType, d]));
+    expect(byType['Competition I'].playerScores[0].judgeScores.judge1).toBe(8.1);
+    expect(byType['Competition II'].playerScores[0].judgeScores.judge1).toBe(6.4);
+
+    // Locking one category must not touch the other.
+    await scoringService.lockScoresForAgeGroup(competitionId, 'Under14', new mongoose.Types.ObjectId());
+    const locked = await Score.find({ teamId, competition: competitionId });
+    expect(locked.every((d) => d.isLocked)).toBe(true);
+  });
+
+  test('a judge cannot impersonate another panel member at any point', async () => {
+    // Judge 2 claims to be the Senior Judge on every submission.
+    await post(tokenFor(j2), slip({ judgeType: 'Senior Judge', score: 10 }));
+
+    const doc = await Score.findOne({ teamId, competition: competitionId });
+    const performer = doc.playerScores[0];
+
+    expect(performer.judgeScores.judge2).toBe(10);
+    expect(performer.judgeScores.seniorJudge ?? 0).not.toBe(10);
+    expect(performer.judgeSlips.map((s) => s.judgeRole)).toEqual(['J2']);
+  });
+
+  test('concurrent submissions from a whole panel all survive', async () => {
+    const responses = await Promise.all([
+      post(tokenFor(senior), slip({ score: 8.0 })),
+      post(tokenFor(j1), slip({ score: 8.1 })),
+      post(tokenFor(j2), slip({ score: 8.2 })),
+    ]);
+
+    for (const res of responses) expect(res.status).toBe(200);
+
+    const doc = await Score.findOne({ teamId, competition: competitionId });
+    const performer = doc.playerScores[0];
+
+    expect(performer.judgeScores.seniorJudge).toBe(8.0);
+    expect(performer.judgeScores.judge1).toBe(8.1);
+    expect(performer.judgeScores.judge2).toBe(8.2);
+  });
+  test('every slip records the judge account that wrote it', async () => {
+    expect((await post(tokenFor(j1), slip({ score: 8.1 }))).status).toBe(200);
+    expect((await post(tokenFor(senior), slip({ score: 8.2 }))).status).toBe(200);
+
+    // The Senior Judge can no longer correct another judge's slip
+    // (user rule 2026-11-09): refused, and Judge 1's mark stays as it was.
+    const override = await post(tokenFor(senior), slip({ score: 8.0, judgeType: 'Judge 1', overrideBySenior: true }));
+    expect(override.status).toBe(403);
+
+    const doc = await Score.findOne({ teamId, competition: competitionId }).lean();
+    const byRole = Object.fromEntries(doc.playerScores[0].judgeSlips.map((s) => [s.judgeRole, s]));
+
+    expect(String(byRole.SR_JUDGE.judgeAccountId)).toBe(String(senior.account._id));
+    expect(byRole.SR_JUDGE.attribution).toBe('recorded');
+    expect(String(byRole.J1.judgeAccountId)).toBe(String(j1.account._id));
+    expect(byRole.J1.attribution).toBe('recorded');
+    expect(byRole.J1.total).toBe(8.1);
+  });
+
+  // User rule 2026-11-09: Edit My Score at most 3 times, every judge alike.
+  test('a judge may edit a slip three times, then is refused until restored', async () => {
+    expect((await post(tokenFor(j1), slip({ score: 8.0 }))).status).toBe(200);
+    for (const score of [8.1, 8.2, 8.3]) {
+      expect((await post(tokenFor(j1), slip({ score }))).status).toBe(200);
+    }
+    const fourth = await post(tokenFor(j1), slip({ score: 8.4 }));
+    expect(fourth.status).toBe(422);
+    expect(JSON.stringify(fourth.body)).toMatch(/edits/i);
+
+    let doc = await Score.findOne({ teamId, competition: competitionId }).lean();
+    const j1Slip = doc.playerScores[0].judgeSlips.find((s) => s.judgeRole === 'J1');
+    expect(j1Slip.total).toBe(8.3);
+    expect(j1Slip.editCount).toBe(3);
+
+    // The Senior Judge is held to the same three.
+    expect((await post(tokenFor(senior), slip({ score: 8.0 }))).status).toBe(200);
+    for (const score of [8.1, 8.2, 8.3]) {
+      expect((await post(tokenFor(senior), slip({ score }))).status).toBe(200);
+    }
+    expect((await post(tokenFor(senior), slip({ score: 8.4 }))).status).toBe(422);
+
+    // An admin restores the allowance; the judge can edit again.
+    const restorer = new ScoringService(
+      new ScoreRepository(noopLogger), null, null, null, null, noopLogger, new CalculationService(noopLogger)
+    );
+    const result = await restorer.restoreSlipEdits(
+      doc._id, { playerId: String(doc.playerScores[0].playerId), judgeType: 'Judge 1' }, new mongoose.Types.ObjectId()
+    );
+    expect(result.slipsRestored).toBe(1);
+    expect((await post(tokenFor(j1), slip({ score: 8.4 }))).status).toBe(200);
+    // Only Judge 1 was restored: the Senior Judge is still out of edits.
+    expect((await post(tokenFor(senior), slip({ score: 8.5 }))).status).toBe(422);
+  });
+
+  // User rule 2026-11-23: the Senior Judge of THIS panel unlocks a seat's
+  // used-up edits on one athlete - their own seat too - and nobody else can.
+  test('the Senior Judge unlocks used-up edits on their own panel only', async () => {
+    const seatsOf = (who) => Judge.find({ judgeAccount: who.account._id }).lean();
+    const useAllEdits = async (who) => {
+      for (const score of [8.0, 8.1, 8.2, 8.3]) {
+        expect((await post(tokenFor(who), slip({ score }))).status).toBe(200);
+      }
+    };
+    const target = (judgeType) => ({ playerId: playerId.toString(), apparatus: 'Pole Mallakhamb', judgeType });
+
+    expect((await post(tokenFor(j1), slip({ score: 8.0 }))).status).toBe(200);
+    let doc = await Score.findOne({ teamId, competition: competitionId }).lean();
+
+    // Edits left -> refused, no topping up early.
+    await expect(scoringService.restoreSlipEditsAsSenior(doc._id, target('Judge 1'), senior.account, await seatsOf(senior)))
+      .rejects.toMatchObject({ statusCode: 409 });
+
+    await post(tokenFor(j1), slip({ score: 8.1 }));
+    await post(tokenFor(j1), slip({ score: 8.2 }));
+    await post(tokenFor(j1), slip({ score: 8.3 }));
+    expect((await post(tokenFor(j1), slip({ score: 8.4 }))).status).toBe(422);
+
+    // A panel judge, or a Senior Judge of another panel, is refused.
+    await expect(scoringService.restoreSlipEditsAsSenior(doc._id, target('Judge 1'), j2.account, await seatsOf(j2)))
+      .rejects.toMatchObject({ statusCode: 403 });
+    const otherAccount = await JudgeAccount.create({
+      firstName: 'Other', lastName: 'Chief', email: 'sr9@club.in', password: 'PlaintextSecret1', isActive: true,
+    });
+    await Judge.create({
+      judgeAccount: otherAccount._id, competition: competitionId, competitionTypes: ['competition_1'],
+      gender: 'Male', ageGroup: 'Under18', judgeNo: 1, judgeType: 'Senior Judge', isActive: true,
+    });
+    const other = { account: otherAccount };
+    await expect(scoringService.restoreSlipEditsAsSenior(doc._id, target('Judge 1'), other.account, await seatsOf(other)))
+      .rejects.toMatchObject({ statusCode: 403 });
+
+    // This panel's Senior Judge unlocks Judge 1, who gets 3 edits again.
+    const result = await scoringService.restoreSlipEditsAsSenior(doc._id, target('Judge 1'), senior.account, await seatsOf(senior));
+    expect(result.slipsRestored).toBe(1);
+    for (const score of [8.4, 8.5, 8.6]) {
+      expect((await post(tokenFor(j1), slip({ score }))).status).toBe(200);
+    }
+    expect((await post(tokenFor(j1), slip({ score: 8.7 }))).status).toBe(422);
+
+    // Their own seat too.
+    await useAllEdits(senior);
+    expect((await post(tokenFor(senior), slip({ score: 8.4 }))).status).toBe(422);
+    await scoringService.restoreSlipEditsAsSenior(doc._id, target('Senior Judge'), senior.account, await seatsOf(senior));
+    expect((await post(tokenFor(senior), slip({ score: 8.4 }))).status).toBe(200);
+
+    // Once the athlete is final, no more unlocks.
+    await Score.updateOne({ _id: doc._id }, { $set: { 'playerScores.0.isFinalized': true, 'playerScores.0.judgeSlips.$[s].editCount': 3 } },
+      { arrayFilters: [{ 's.judgeRole': 'J1' }] });
+    await expect(scoringService.restoreSlipEditsAsSenior(doc._id, target('Judge 1'), senior.account, await seatsOf(senior)))
+      .rejects.toMatchObject({ statusCode: 409 });
+  });
+});

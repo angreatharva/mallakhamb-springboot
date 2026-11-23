@@ -1,0 +1,106 @@
+/**
+ * Public Controller
+ *
+ * HTTP handlers for unauthenticated public read endpoints.
+ *
+ * @module controllers/public.controller
+ */
+
+const crypto = require('crypto');
+const { asyncHandler } = require('../middleware/error.middleware');
+const { getCopRulesData } = require('../config/cop-rules');
+
+/**
+ * @param {Object} container - DI container
+ * @returns {Object} Controller methods
+ */
+function createPublicController(container) {
+  const publicService = container.resolve('publicService');
+
+  return {
+    /** @route GET /api/public/competitions */
+    getPublicCompetitions: asyncHandler(async (req, res) => {
+      const competitions = await publicService.getPublicCompetitions();
+      res.json({ success: true, data: competitions });
+    }),
+
+    /** @route GET /api/public/teams */
+    getPublicTeams: asyncHandler(async (req, res) => {
+      const { competitionId } = req.query;
+      const teams = await publicService.getPublicTeams(competitionId);
+      res.json({ success: true, data: teams });
+    }),
+
+    /**
+     * @route GET /api/public/scores
+     *
+     * Only the category filters are read off the query string. `lockedOnly`
+     * used to be forwarded too, which let an anonymous caller ask for
+     * un-locked sheets — see the note on publicService.getPublicScores. What
+     * is published is a server decision, not a request parameter.
+     */
+    getPublicScores: asyncHandler(async (req, res) => {
+      const { competitionId, teamId, gender, ageGroup, competitionType, apparatus } = req.query;
+      const scores = await publicService.getPublicScores(competitionId, {
+        // `teamId` has always been sent by PerformancePanel and was dropped
+        // here, so that component rendered the whole competition.
+        teamId,
+        gender,
+        ageGroup,
+        competitionType,
+        apparatus,
+      });
+      res.json({ success: true, data: scores });
+    }),
+
+    /**
+     * @route GET /api/public/team-championship
+     *
+     * One category's Team Championship (Competition I) standing, from the
+     * same published scores the player board shows.
+     */
+    getPublicTeamChampionship: asyncHandler(async (req, res) => {
+      const { competitionId, gender, ageGroup } = req.query;
+      const standings = await publicService.getPublicTeamChampionship(competitionId, { gender, ageGroup });
+      res.json({ success: true, data: standings });
+    }),
+
+    /**
+     * @route GET /api/public/cop-rules
+     *
+     * Serves the COP Nov 2022 constants so the client can stop maintaining a
+     * hand-synced copy (MED-7 / task 3.3). This is static reference data, so it
+     * is cached hard and carries a strong ETag — the tables change only when
+     * the Code of Points itself is revised.
+     */
+    getCopRules: asyncHandler(async (req, res) => {
+      const data = getCopRulesData();
+
+      // Derived from the payload, so it changes automatically whenever the
+      // rules do — no version constant to forget to bump.
+      const etag = `W/"cop-${crypto
+        .createHash('sha1')
+        .update(JSON.stringify(data))
+        .digest('hex')
+        .slice(0, 16)}"`;
+
+      res.set('ETag', etag);
+      res.set('Cache-Control', 'public, max-age=3600');
+
+      if (req.headers['if-none-match'] === etag) {
+        return res.status(304).end();
+      }
+
+      res.json({ success: true, data });
+    }),
+
+    /** @route GET /api/public/rankings/:competitionId/:ageGroup */
+    getPublicRankings: asyncHandler(async (req, res) => {
+      const { competitionId, ageGroup } = req.params;
+      const rankings = await publicService.getPublicRankings(competitionId, ageGroup);
+      res.json({ success: true, data: rankings });
+    }),
+  };
+}
+
+module.exports = createPublicController;

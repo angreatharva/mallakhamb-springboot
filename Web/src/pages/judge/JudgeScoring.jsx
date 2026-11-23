@@ -1,0 +1,1158 @@
+import { useState, useEffect, useRef, useId, useContext } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { CheckCircle, Send, BookOpen, X, Minus
+} from 'lucide-react';
+import { AnimatePresence } from 'framer-motion';
+import toast from 'react-hot-toast';
+import { logger } from '@/infrastructure/logger';
+import { judgeAPI } from '@/services/public/judge.api';
+import { secureStorage } from '@/utils/auth/secureStorage';
+import { useAuth } from '../../contexts/AuthContext';
+import { ConfirmDialog } from '@/components/ui';
+import { useCompetition } from '../../contexts/CompetitionContext';
+import { FG } from '@/styles/tokens';
+import { useReducedMotion } from '@/hooks/useResponsive';
+import { useCompetitionLock } from '@/hooks/useCompetitionLock';
+import CompetitionLockBanner from '@/components/competition/CompetitionLockBanner';
+import { apparatusKey } from '@/utils/scoring/apparatus';
+import {
+  getCombinationChecklist,
+  getDifficultyRequirement,
+  computeCombinationTotal,
+  resolveDifficultyValue,
+  difficultyClassMax,
+  roundExecution,
+  isExecutionEntered,
+  EXECUTION_TOO_LOW_MESSAGE,
+  POINT_CEILINGS,
+} from '@/utils/scoring/copRules';
+import ScorerScoring from './ScorerScoring'; // Import scorer component
+import TimeKeeperScoring from './TimeKeeperScoring';
+import { J, JudgeAmbience, PANEL_REVIEW_PATH, ACTIVE_SESSION_KEY, playerIdOf, normalizeBreakdown, DecimalInput, scoringCacheKey, DifficultyPicker, DIFFICULTY_CLASSES, JudgeHeader, ScoringFor, SlipReadOnly } from './judgeShared';
+import { useJudgeSession, useJudgeInfo, useJudgePanelData } from './useJudgePanelData';
+import { BodyScrollLock } from '@/hooks/useBodyScrollLock';
+
+// ─── COP PDF Modal ────────────────────────────────────────────────────────────
+const CopPdfModal = ({ isOpen, onClose }) => {
+  if (!isOpen) return null;
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <div className="fixed inset-0 z-[9999] flex flex-col" data-appearance="dark" role="dialog" aria-modal="true" aria-label="Code of Points" style={{ background: 'var(--scrim)', backdropFilter: 'blur(12px)' }}>
+          <BodyScrollLock />
+          {/* Modal header */}
+          <div
+            className="flex items-center justify-between px-4 sm:px-6 py-3 flex-shrink-0 border-b"
+            style={{ background: 'rgb(var(--accent) / 0.12)', borderColor: 'rgb(var(--accent) / 0.25)' }}
+          >
+            <div className="flex items-center gap-3">
+              <div
+                className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
+                style={{ background: 'rgb(var(--accent))' }}
+              >
+                <BookOpen className="w-4 h-4 text-ink" />
+              </div>
+              <div>
+                <p className="text-ink font-black text-sm leading-tight">Code of Points</p>
+                <p className="text-xs" style={{ color: 'rgb(var(--accent-fg) / 0.8)' }}>COP Mallakhamb — Rules &amp; Scoring Guide</p>
+              </div>
+            </div>
+            <button onClick={onClose} className="w-9 h-9 tap-safe rounded-xl flex items-center justify-center border transition-all duration-200 hover:bg-red-500/10" style={{ borderColor: 'rgb(var(--danger-fg) / 0.3)', color: FG.danger }} aria-label="Close COP PDF">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          {/* PDF iframe */}
+          <div className="flex-1 min-h-0">
+            <iframe
+              src="/docs/COP-Mallakhamb.pdf"
+              title="COP Mallakhamb Rules"
+              className="w-full h-full"
+              style={{ border: 'none' }}
+            />
+          </div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+};
+
+const ScoreInput = ({ label, ariaLabel, value, onChange, hint }) => {
+  const readOnly = useContext(SlipReadOnly);
+  const [focused, setFocused] = useState(false);
+  // The label was visible but not linked, so the mark field had no name for a
+  // screen reader ("edit text" — for Execution or Originality alike).
+  const inputId = useId();
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <label htmlFor={inputId} className="type-tag text-fg-secondary">{label}</label>
+        {hint && <span className="text-xs text-fg-muted">{hint}</span>}
+      </div>
+      <div className="relative rounded-xl border overflow-hidden">
+        <style>{`
+          .no-spinners::-webkit-inner-spin-button,
+          .no-spinners::-webkit-outer-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+          }
+          .no-spinners {
+            -moz-appearance: textfield;
+          }
+        `}</style>
+        <DecimalInput
+          impliedDecimal
+          id={inputId}
+          aria-label={label ? undefined : ariaLabel}
+          value={value}
+          onValueChange={onChange}
+          readOnly={readOnly}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          className="w-full px-4 py-3 text-2xl font-black text-center bg-transparent no-spinners"
+          style={{ color: FG.ink, background: 'rgb(var(--ink) / 0.04)', fontSize: '1.5rem' }}
+        />
+      </div>
+    </div>
+  );
+};
+
+const ScoreRow = ({ label, value, max, color = 'var(--fg)' }) => (
+  <div className="flex items-center justify-between py-2 border-b border-line">
+    <span className="type-body-s text-fg-secondary">{label}</span>
+    <span className="text-sm font-bold tabular-nums" style={{ color }}>
+      {typeof value === 'number' ? value.toFixed(2) : value}
+      <span className="text-xs font-normal ml-1 text-fg-muted">/ {max}</span>
+    </span>
+  </div>
+);
+
+const CheckRow = ({ checked, onChange, label, penalty }) => {
+  const readOnly = useContext(SlipReadOnly);
+  return (
+  <label className={`flex items-center gap-3 p-3.5 rounded-xl border transition-all duration-200 min-h-[52px] ${readOnly ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+    style={{
+      background: checked ? 'rgb(var(--success-fg) / 0.08)' : 'rgb(var(--ink) / 0.03)',
+      borderColor: checked ? 'rgb(var(--success-fg) / 0.3)' : 'rgb(var(--ink) / 0.07)',
+    }}>
+    <div className="w-5 h-5 rounded-md border-2 flex items-center justify-center flex-shrink-0 transition-all duration-200"
+      style={{ borderColor: checked ? J.green : 'rgb(var(--ink) / 0.2)', background: checked ? J.green : 'transparent' }}>
+      {checked && <CheckCircle className="w-3.5 h-3.5 text-ink" aria-hidden="true" />}
+    </div>
+    <input type="checkbox" checked={checked} onChange={onChange} disabled={readOnly} className="sr-only" />
+    <span className="text-sm font-medium" style={{ color: checked ? FG.ink : 'rgb(var(--ink) / 0.5)' }}>{label}</span>
+    {!checked && <span className="ml-auto text-xs font-bold text-fg-muted">{penalty.toFixed(2)}</span>}
+  </label>
+  );
+};
+
+/**
+ * Ticks every combination requirement at once, or clears them all when every
+ * one is already ticked. Mixed while only some are, so a routine that met
+ * nearly everything is one tap to select all and one to untick the misses.
+ */
+const SelectAllRow = ({ metCount, itemCount, onChange, className = '' }) => {
+  const readOnly = useContext(SlipReadOnly);
+  const all = itemCount > 0 && metCount === itemCount;
+  const some = metCount > 0 && !all;
+  const inputRef = useRef(null);
+  // `indeterminate` has no HTML attribute; it can only be set on the element.
+  useEffect(() => {
+    if (inputRef.current) inputRef.current.indeterminate = some;
+  }, [some]);
+  return (
+    <label className={`flex items-center gap-3 p-3.5 rounded-xl border transition-all duration-200 min-h-[52px] ${readOnly ? 'cursor-not-allowed' : 'cursor-pointer'} ${className}`}
+      style={{
+        background: all ? 'rgb(var(--success-fg) / 0.08)' : 'rgb(var(--accent) / 0.08)',
+        borderColor: all ? 'rgb(var(--success-fg) / 0.3)' : 'rgb(var(--accent) / 0.3)',
+      }}>
+      <div className="w-5 h-5 rounded-md border-2 flex items-center justify-center flex-shrink-0 transition-all duration-200"
+        style={{ borderColor: all || some ? J.green : 'rgb(var(--ink) / 0.2)', background: all ? J.green : 'transparent' }}>
+        {all && <CheckCircle className="w-3.5 h-3.5 text-ink" aria-hidden="true" />}
+        {some && <Minus className="w-3.5 h-3.5 text-success-fg" aria-hidden="true" />}
+      </div>
+      <input ref={inputRef} type="checkbox" checked={all} onChange={onChange} disabled={readOnly} className="sr-only" />
+      <span className="text-sm font-bold text-ink">Select all</span>
+      <span className="ml-auto text-xs font-bold text-fg-muted">{metCount} / {itemCount}</span>
+    </label>
+  );
+};
+
+/**
+ * The judge's own scoring slip.
+ *
+ * HIGH-W1: a Scorer must never reach this component. The Scorer/judge branch
+ * now lives in the `JudgeScoring` dispatcher at the bottom of this file, above
+ * every hook call. Do not reintroduce an early return here — the ~17 hooks
+ * below it would then run conditionally, and React throws "Rendered more hooks
+ * than during the previous render" the moment the branch flips on an existing
+ * instance.
+ */
+const JudgeSlip = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { logout } = useAuth();
+  const { clearCompetitionContext } = useCompetition();
+  useReducedMotion();
+
+  /*
+   * The page header's real height, so the phone layout's pinned block (Live
+   * Final Score + the Difficulty / Combination / Exec & Orig tabs) sits right
+   * under it. It was pinned at a fixed 57px — the one-row desktop header —
+   * but on a phone the header is two rows (judge + athlete banner), so it
+   * covered the score card and only the tabs stayed in view. Measured, and
+   * re-measured on resize, so a wrapped name or larger text still fits.
+   */
+  const headerRef = useRef(null);
+  const [headerHeight, setHeaderHeight] = useState(57);
+
+  // Session, judge identity and the live panel feed are shared with the
+  // Panel Review page — see useJudgePanelData.
+  const session = useJudgeSession(location.state);
+  const {
+    activeSessionData,
+    selectedTeam,
+    selectedPlayer,
+    selectedCompetitionType,
+    selectedApparatus,
+    selectedGender,
+    selectedAgeGroup,
+  } = session;
+
+  const judgeInfo = useJudgeInfo();
+  const {
+    panelScores, setPanelScores, finalized, socket, isConnected, loaded: panelLoaded,
+    mySeat: panelMySeat, seatReady,
+  } = useJudgePanelData({ judgeInfo, session });
+
+  /**
+   * The seat this judge holds for the category being scored. A judge working
+   * two panels is a different role in each, so the slip, the panel lookup and
+   * the badge all have to follow the category — not the account's first seat.
+   */
+  // From the panel hook: the server's panel first, the stored seats as the
+  // fallback (see useJudgePanelData). Not the stored seats alone — on some
+  // phones they were empty, and the slip then never found its own score.
+  const mySeat = panelMySeat;
+  const myJudgeType = mySeat?.judgeType;
+
+
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [showCopModal, setShowCopModal] = useState(false);
+  // Senior Judge's "Absent" (user rule 2026-11-15) — asks before it writes.
+  const [confirmAbsent, setConfirmAbsent] = useState(false);
+  /*
+   * The meet closed at 23:59 UTC on its end date, so the server will refuse
+   * this slip with a 423 whatever the sheet does. Read here so the sheet says
+   * so up front instead of after a judge has marked a whole routine — the same
+   * reason `finalized` is checked before submitting rather than after.
+   */
+  const { locked: competitionLocked } = useCompetitionLock();
+  // True while the judge is deliberately re-editing an already-submitted slip,
+  // so the restore effect below does not pull them straight back to review.
+  const editingRef = useRef(location.state?.resumeEditing === true);
+  // Guards the one-shot restore of an already-submitted slip.
+  const restoredRef = useRef(false);
+  /*
+   * Re-editing opens on the slip the judge SUBMITTED, and that is read from the
+   * server after the page mounts. Until it lands the form would show zeros —
+   * and anything the judge changed in the meantime was then overwritten by the
+   * late load, putting the old score back. So the sheet waits for it.
+   */
+  const [slipReady, setSlipReady] = useState(() => location.state?.resumeEditing !== true);
+
+  // Active mobile tab state
+  const [activeMobileTab, setActiveMobileTab] = useState('difficulty'); // 'difficulty' | 'combination' | 'exec_orig'
+  // Tabs switch ONLY on a tap of the tab itself (user rule 2026-11-07). The
+  // left/right swipe was removed: a judge dragging across the difficulty grid
+  // or the checklist flipped the tab mid-marking. Don't bring it back.
+
+  // A new tab opens at its top. Without this the page kept the previous tab's
+  // scroll offset, so switching from the bottom of Combination landed the
+  // judge half-way down Exec & Orig. Skips the first render so a refresh or
+  // an edit does not jump the page.
+  const tabMountedRef = useRef(false);
+  useEffect(() => {
+    if (!tabMountedRef.current) { tabMountedRef.current = true; return; }
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+  }, [activeMobileTab]);
+
+
+  const goBackAfterScoring = () => {
+    // Clear cached scores when leaving the scoring page
+    const cacheKey = getScoringCacheKey();
+    if (cacheKey) {
+      try {
+        localStorage.removeItem(cacheKey);
+      } catch (e) {
+        logger.warn('Failed to clear cached scores on navigation', e);
+      }
+    }
+    sessionStorage.removeItem(ACTIVE_SESSION_KEY);
+    const returnTo = activeSessionData?.returnTo
+      || (selectedTeam?._id ? `/judge/team/${selectedTeam._id}` : '/judge/dashboard');
+    navigate(returnTo, {
+      state: selectedTeam?._id
+        ? {
+            team: selectedTeam,
+            competitionType: selectedCompetitionType,
+            apparatus: selectedApparatus,
+            gender: selectedGender,
+            ageGroup: selectedAgeGroup,
+          }
+        : undefined,
+    });
+  };
+
+  // Apparatus-specific combination checklist (COP §5.1–5.3). Defaults to Pole
+  // if no apparatus was passed. Stable for the component's lifetime.
+  const combinationChecklist = useRef(getCombinationChecklist(selectedApparatus)).current;
+
+  // Build the initial combination map with all items unchecked.
+  const buildInitialCombination = () => {
+    const checked = {};
+    combinationChecklist.forEach(item => { checked[item.id] = false; });
+    const total = computeCombinationTotal(selectedApparatus, checked);
+    return { checked, total };
+  };
+
+  // Generate a unique key for this scoring session
+  const getScoringCacheKey = () => scoringCacheKey(selectedTeam, selectedPlayer, judgeInfo);
+
+  // Load initial scores from cache or create new
+  const getInitialScores = () => {
+    const cacheKey = getScoringCacheKey();
+    if (cacheKey) {
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          // Validate cached data structure
+          if (parsed.difficulty && parsed.combination && typeof parsed.execution === 'number') {
+            return parsed;
+          }
+        }
+      } catch (e) {
+        logger.warn('Failed to load cached scores', e);
+      }
+    }
+    return {
+      difficulty: { aClass: 0, bClass: 0, cClass: 0, total: 0 },
+      combination: buildInitialCombination(),
+      execution: 0,
+      bonus: 0
+    };
+  };
+
+  const [scores, setScores] = useState(getInitialScores);
+
+  /*
+   * Restore the autosaved marks after a refresh.
+   *
+   * The cache key names the judge, and useJudgeInfo reads the judge in an
+   * effect — so on the first render it is still null, getInitialScores looks
+   * under `…_unknown`, finds nothing, and the marks the judge had entered were
+   * never read back. Load them once, as soon as the real key exists.
+   */
+  const cacheRestoredRef = useRef(false);
+  useEffect(() => {
+    if (cacheRestoredRef.current || !judgeInfo) return;
+    const cacheKey = getScoringCacheKey();
+    if (!cacheKey) return;
+    cacheRestoredRef.current = true;
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (!cached) return;
+      const parsed = JSON.parse(cached);
+      if (parsed.difficulty && parsed.combination && typeof parsed.execution === 'number') {
+        setScores(parsed);
+        // Re-editing: these are this edit's unsaved changes (Panel Review
+        // clears the key on the way in), so the submitted slip must not
+        // replace them when it loads.
+        if (editingRef.current) {
+          restoredRef.current = true;
+          setSlipReady(true);
+        }
+      }
+    } catch (e) {
+      logger.warn('Failed to restore cached scores', e);
+    }
+  }, [judgeInfo]);
+
+  // Auto-save scores to localStorage whenever they change. Not before the judge
+  // is known: the key would be `…_unknown`, a slot nothing ever reads back.
+  useEffect(() => {
+    const cacheKey = getScoringCacheKey();
+    if (judgeInfo && cacheKey && !submitted && !finalized) {
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify(scores));
+      } catch (e) {
+        logger.warn('Failed to cache scores', e);
+      }
+    }
+  }, [scores, submitted, finalized]);
+
+  /*
+   * Warn before a refresh or tab close throws away an unsubmitted slip.
+   *
+   * Browsers do not let a page draw its own dialog here — returning from
+   * `beforeunload` is the only hook, and the browser shows its standard
+   * "Reload site? Changes may not be saved" prompt. iOS Safari ignores it
+   * entirely, which is why the marks are also autosaved and restored above.
+   */
+  const hasUnsubmittedMarks =
+    !submitted && !finalized && (
+      scores.difficulty.total > 0 ||
+      Object.values(scores.combination.checked || {}).some(Boolean) ||
+      parseFloat(scores.execution || 0) > 0 ||
+      parseFloat(scores.bonus || 0) > 0
+    );
+  useEffect(() => {
+    if (!hasUnsubmittedMarks) return undefined;
+    const warn = (e) => {
+      e.preventDefault();
+      // Chrome/Edge still need returnValue set to show the prompt.
+      e.returnValue = '';
+      return '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [hasUnsubmittedMarks]);
+
+  // Clear cached scores when score is submitted or finalized
+  useEffect(() => {
+    if (submitted || finalized) {
+      const cacheKey = getScoringCacheKey();
+      if (cacheKey) {
+        try {
+          localStorage.removeItem(cacheKey);
+        } catch (e) {
+          logger.warn('Failed to clear cached scores', e);
+        }
+      }
+    }
+  }, [submitted, finalized]);
+
+  // Restore an already-submitted slip once the panel feed lands, so the form
+  // shows what this judge sent. Normally this also hands off straight to
+  // Panel Review; while the judge is deliberately re-editing (resumeEditing),
+  // the scores are still restored — the cache was cleared on submit, so this
+  // panel feed is the only place the prior values still exist — but we stay
+  // on this page instead of redirecting and leave submitted/editable as-is.
+  useEffect(() => {
+    if (!judgeInfo || restoredRef.current || !myJudgeType) return;
+    const myScore = panelScores[myJudgeType];
+    if (!myScore) return;
+    restoredRef.current = true;
+    if (myScore.breakdown) {
+      const b = normalizeBreakdown(myScore.breakdown, myScore.score);
+      setScores({
+        difficulty: {
+          aClass: b.difficulty.aClass || 0,
+          bClass: b.difficulty.bClass || 0,
+          cClass: b.difficulty.cClass || 0,
+          total: b.difficulty.total || 0,
+        },
+        combination: {
+          checked: { ...buildInitialCombination().checked, ...(b.combination.checked || {}) },
+          total: b.combination.total ?? 0,
+        },
+        execution: b.execution || 0,
+        bonus: b.bonus || 0,
+      });
+    }
+    setSlipReady(true);
+    if (editingRef.current) return;
+    setSubmitted(true);
+    // Replace rather than push so Back still leaves the page.
+    navigate(PANEL_REVIEW_PATH, { replace: true, state: activeSessionData });
+  }, [panelScores, judgeInfo, navigate, activeSessionData, myJudgeType]);
+
+  // The read settled without a slip of ours (or failed): nothing to wait for.
+  // Not before the seat is known either — until then "no slip of mine" is only
+  // "not looked up yet", and opening the form then showed a blank slip.
+  useEffect(() => {
+    if (panelLoaded && seatReady) setSlipReady(true);
+  }, [panelLoaded, seatReady]);
+
+  // Covers the judge who is re-editing their slip (resumeEditing) at the
+  // moment the Senior Judge finalizes elsewhere — the panel score is now
+  // locked, so bounce back to the team page like everyone else.
+  useEffect(() => {
+    if (!finalized) return;
+    const t = setTimeout(() => goBackAfterScoring(), 800);
+    return () => clearTimeout(t);
+  }, [finalized]);
+
+  const resetScores = () => {
+    const newScores = {
+      difficulty: { aClass: 0, bClass: 0, cClass: 0, total: 0 },
+      combination: buildInitialCombination(),
+      execution: 0, bonus: 0
+    };
+    setScores(newScores);
+    // Clear cached scores when reset
+    const cacheKey = getScoringCacheKey();
+    if (cacheKey) {
+      try {
+        localStorage.removeItem(cacheKey);
+      } catch (e) {
+        logger.warn('Failed to clear cached scores on reset', e);
+      }
+    }
+  };
+
+  const handleDifficulty = (cls, val) => {
+    const n = parseInt(val) || 0;
+    const d = { ...scores.difficulty, [cls]: n };
+    // Use C→B→A cascade: excess higher-class elements fill lower-class slots
+    const resolved = resolveDifficultyValue(
+      { A: d.aClass, B: d.bClass, C: d.cClass },
+      req
+    );
+    // Hard-cap at the COP difficulty ceiling (3.80)
+    d.total = Math.min(resolved.total, POINT_CEILINGS.difficulty);
+    setScores({ ...scores, difficulty: d });
+  };
+
+  const handleCombination = (itemId) => {
+    const checked = { ...scores.combination.checked, [itemId]: !scores.combination.checked[itemId] };
+    const total = computeCombinationTotal(selectedApparatus, checked);
+    setScores({ ...scores, combination: { checked, total } });
+  };
+
+  const combinationMet = combinationChecklist.filter((item) => scores.combination.checked[item.id]).length;
+
+  // Select all: tick every requirement, or clear them when all are ticked.
+  const handleCombinationAll = () => {
+    const tick = combinationMet < combinationChecklist.length;
+    const checked = { ...scores.combination.checked };
+    combinationChecklist.forEach((item) => { checked[item.id] = tick; });
+    const total = computeCombinationTotal(selectedApparatus, checked);
+    setScores({ ...scores, combination: { checked, total } });
+  };
+
+  const req = getDifficultyRequirement(selectedCompetitionType);
+  // What each class scores, and the most it can (shown on each picker row).
+  const difficultyResolved = resolveDifficultyValue(
+    { A: scores.difficulty.aClass, B: scores.difficulty.bClass, C: scores.difficulty.cClass }, req
+  );
+  const difficultyMax = difficultyClassMax(req);
+
+  // Difficulty mix warning (COP §4.1) — non-blocking. Fires when any entered
+  // count differs from the required mix for this competition type.
+  const difficultyMismatch =
+    (scores.difficulty.aClass || 0) !== req.A ||
+    (scores.difficulty.bClass || 0) !== req.B ||
+    (scores.difficulty.cClass || 0) !== req.C;
+
+  const calcFinal = () => (
+    scores.difficulty.total + scores.combination.total +
+    parseFloat(scores.execution || 0) + parseFloat(scores.bonus || 0)
+  ).toFixed(2);
+
+  const submitScore = async () => {
+    if (!selectedPlayer) return;
+    if (parseFloat(calcFinal()) === 0) { toast.error('Please enter scores'); return; }
+    // Execution 0.00 is never a real mark: the button already reads disabled,
+    // and a tap on it lands here and only shows the popup.
+    if (!isExecutionEntered(scores.execution)) {
+      toast.error(EXECUTION_TOO_LOW_MESSAGE, { id: 'execution-too-low' });
+      return;
+    }
+    if (finalized) { toast.error('Panel score is already finalized'); return; }
+    if (competitionLocked) {
+      toast.error('This competition has closed. Scores can no longer be changed.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const finalScore = calcFinal();
+      const breakdown = {
+        difficulty: scores.difficulty,
+        combination: { total: scores.combination.total, checked: scores.combination.checked },
+        execution: parseFloat(scores.execution || 0),
+        originality: parseFloat(scores.bonus || 0),
+        bonus: parseFloat(scores.bonus || 0)
+      };
+      const scoreData = {
+        playerId: playerIdOf(selectedPlayer), playerName: selectedPlayer.name,
+        judgeType: myJudgeType, judgeNo: mySeat?.judgeNo, score: parseFloat(finalScore),
+        teamId: selectedTeam._id,
+        gender: selectedGender || judgeInfo.gender,
+        ageGroup: selectedAgeGroup || judgeInfo.ageGroup,
+        competitionType: selectedCompetitionType,
+        competitionId: judgeInfo.competition?._id || judgeInfo.competition,
+        apparatus: selectedApparatus,
+        breakdown
+      };
+      // HIGH-W3: through judgeAPI so a 401 gets a silent refresh rather than
+      // surfacing as a failed submission mid-performance.
+      await judgeAPI.saveScore(scoreData);
+      try {
+        // Keyed by athlete AND apparatus: an athlete entered for three of them
+        // is judged three times, and marking the athlete alone would grey out
+        // the other two before anyone had scored them.
+        const sKey = `judge_submitted_players_${selectedTeam._id}`;
+        const prev = JSON.parse(sessionStorage.getItem(sKey) || '{}');
+        prev[`${playerIdOf(selectedPlayer)}::${apparatusKey(selectedApparatus)}`] = true;
+        sessionStorage.setItem(sKey, JSON.stringify(prev));
+      } catch {
+        // best-effort cache of "already scored" markers
+      }
+      if (socket?.connected) {
+        socket.emit('score_update', {
+          ...scoreData,
+          roomId: `scoring_${selectedGender || mySeat?.gender}_${selectedAgeGroup || mySeat?.ageGroup}_${selectedCompetitionType}`
+        });
+      }
+
+      setPanelScores(prev => ({
+        ...prev,
+        [myJudgeType]: {
+          judgeType: myJudgeType,
+          score: finalScore,
+          breakdown: normalizeBreakdown(breakdown, finalScore),
+          timestamp: new Date().toISOString()
+        }
+      }));
+
+      toast.success(`Score ${finalScore} submitted for ${selectedPlayer.name}`);
+      setSubmitted(true);
+      editingRef.current = false;
+      navigate(PANEL_REVIEW_PATH);
+      
+      // Clear cached scores after successful submission
+      const cacheKey = getScoringCacheKey();
+      if (cacheKey) {
+        try {
+          localStorage.removeItem(cacheKey);
+        } catch (e) {
+          logger.warn('Failed to clear cached scores after submission', e);
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to save score:', error);
+      toast.error(error.response?.data?.error?.message || 'Failed to save score. Please try again.');
+    } finally { setSubmitting(false); }
+  };
+
+  /*
+   * ABSENT (user rule 2026-11-15). The Senior Judge marks an athlete who did
+   * not perform: the server overrides every scoring rule and saves 0.00 for
+   * every judge, time 0, no deduction, final score 0, finalized for the whole
+   * panel. Only an admin's per-athlete unlock undoes it. Throws on failure so
+   * the confirm dialog stays open and says why.
+   */
+  const markAbsent = async () => {
+    try {
+      await judgeAPI.saveScore({
+        markAbsent: true,
+        playerId: playerIdOf(selectedPlayer),
+        playerName: selectedPlayer.name,
+        judgeType: myJudgeType,
+        teamId: selectedTeam._id,
+        gender: selectedGender || judgeInfo.gender,
+        ageGroup: selectedAgeGroup || judgeInfo.ageGroup,
+        competitionType: selectedCompetitionType,
+        competitionId: judgeInfo.competition?._id || judgeInfo.competition,
+        apparatus: selectedApparatus,
+      });
+    } catch (error) {
+      throw new Error(error.response?.data?.error?.message || 'Could not mark the athlete absent. Please try again.');
+    }
+    try {
+      const sKey = `judge_submitted_players_${selectedTeam._id}`;
+      const prev = JSON.parse(sessionStorage.getItem(sKey) || '{}');
+      prev[`${playerIdOf(selectedPlayer)}::${apparatusKey(selectedApparatus)}`] = true;
+      sessionStorage.setItem(sKey, JSON.stringify(prev));
+    } catch {
+      // best-effort cache of "already scored" markers
+    }
+    setSubmitted(true);
+    toast.success(`${selectedPlayer.name} marked absent: 0.00 saved for the whole panel`);
+    goBackAfterScoring();
+  };
+  const canMarkAbsent = myJudgeType === 'Senior Judge' && !finalized && !competitionLocked;
+
+  const handleLogout = async () => {
+    clearCompetitionContext?.();
+    await logout(navigate);
+    toast.success('Logged out successfully');
+  };
+
+  // Measure once the header exists, then follow its size.
+  // (A hook, so it sits above the early return below.)
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return undefined;
+    const update = () => setHeaderHeight(Math.round(el.getBoundingClientRect().height) || 57);
+    update();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [judgeInfo, selectedPlayer]);
+
+  if (!judgeInfo || !selectedPlayer) return null;
+
+  const finalScore = parseFloat(calcFinal());
+  // Submit stays locked until Execution reaches 0.10 — Difficulty and
+  // Combination alone never unlock it. Not the native `disabled` attribute:
+  // a disabled button swallows the tap, and the tap must show the popup.
+  const executionMissing = !isExecutionEntered(scores.execution);
+  return (
+    <div className="min-h-dvh relative pb-24 lg:pb-0 bg-bg text-fg">
+      <JudgeAmbience />
+
+      {/*  Header  */}
+      <JudgeHeader
+        ref={headerRef}
+        wide
+        back={{ label: 'Back to team', onClick: goBackAfterScoring }}
+        title={judgeInfo.name}
+        subtitle={myJudgeType}
+        context={<ScoringFor name={selectedPlayer.name} team={selectedTeam?.name} />}
+        live={isConnected}
+        onLogout={handleLogout}
+      />
+
+      <main className="relative z-10 max-w-[1400px] mx-auto px-3 sm:px-6 py-4 sm:py-5" id="main-content">
+        {/* A finished competition: every mark control below reads this and
+            disables itself, so the slip is view-only, not just unsubmittable. */}
+        <SlipReadOnly.Provider value={competitionLocked}>
+        {/* Before the sheet, not beside the button: the point is that the judge
+            sees it BEFORE marking a routine. Submit is disabled to match. */}
+        <CompetitionLockBanner className="mb-4" />
+
+        {canMarkAbsent && (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border p-3 bg-surface-sunken border-line"
+            data-testid="absent-bar">
+            <p className="m-0 text-sm text-fg-secondary">
+              Athlete did not perform? Mark them absent: 0.00 for every judge, no time, no deduction.
+            </p>
+            <button type="button" onClick={() => setConfirmAbsent(true)} disabled={!isConnected}
+              className="px-4 py-2.5 rounded-xl border text-sm font-black min-h-[44px]"
+              style={{ borderColor: 'rgb(var(--danger-fg) / 0.5)', color: 'rgb(var(--danger-fg))', background: 'rgb(var(--danger-fg) / 0.08)' }}>
+              Mark Absent
+            </button>
+          </div>
+        )}
+
+        {!slipReady && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center"
+            style={{ background: 'rgb(var(--bg) / 0.85)' }} role="status" aria-live="polite">
+            <p className="text-sm font-bold text-ink">Loading your submitted score…</p>
+          </div>
+        )}
+
+        <div>
+          
+                {/* ─── MOBILE VIEW (lg:hidden) ─── */}
+                <div className="block lg:hidden space-y-3 pb-20">
+                  {/* 1. Fixed Top Score Header */}
+                  <div className="sticky z-30 pt-2 pb-3 -mx-3 px-3 backdrop-blur-xl border-b"
+                    data-testid="mobile-score-bar"
+                    style={{ top: headerHeight, background: 'rgb(var(--bg) / 0.95)', borderColor: 'rgb(var(--accent) / 0.2)' }}>
+                    <div className="rounded-2xl p-3 flex items-center justify-between relative overflow-hidden"
+                      style={{ background: 'rgb(var(--surface-raised))', border: '1px solid var(--line)' }}>
+                      <div className="min-w-0 pr-2">
+                        <p className="type-tag text-fg-secondary m-0">Live Final Score</p>
+                        <p className="text-xs text-ink/60 truncate mt-0.5">{selectedPlayer?.name} • <span className="text-fg-muted">{selectedApparatus || 'Pole'}</span></p>
+                      </div>
+                      <div className="flex items-baseline gap-1 flex-shrink-0" key={calcFinal()}>
+                        <span className={`type-num-l leading-none ${parseFloat(calcFinal()) >= 10 ? 'text-accent-fg' : 'text-fg'}`}>{calcFinal()}</span>
+                        <span className="text-xs text-fg-muted font-semibold">/ 10.00</span>
+                      </div>
+                    </div>
+
+                    {/* 2. 3-Tab Bar */}
+                    <div className="grid grid-cols-3 gap-1 mt-2 p-1 rounded-xl border bg-bg/40"
+                      style={{ borderColor: 'rgb(var(--ink) / 0.08)' }}>
+                      <button
+                        type="button"
+                        onClick={() => setActiveMobileTab('difficulty')}
+                        className={`py-2 px-1 min-h-[44px] rounded-lg text-xs font-black transition-all duration-200 text-center truncate ${
+                          activeMobileTab === 'difficulty' ? 'bg-surface-raised text-ink judge-tab--active' : 'text-fg-muted hover:text-ink/80'
+                        }`}
+                      >
+                        Difficulty
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveMobileTab('combination')}
+                        className={`py-2 px-1 min-h-[44px] rounded-lg text-xs font-black transition-all duration-200 text-center truncate ${
+                          activeMobileTab === 'combination' ? 'bg-surface-raised text-ink judge-tab--active' : 'text-fg-muted hover:text-ink/80'
+                        }`}
+                      >
+                        Combination
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveMobileTab('exec_orig')}
+                        className={`py-2 px-1 min-h-[44px] rounded-lg text-xs font-black transition-all duration-200 text-center truncate ${
+                          activeMobileTab === 'exec_orig' ? 'bg-surface-raised text-ink judge-tab--active' : 'text-fg-muted hover:text-ink/80'
+                        }`}
+                      >
+                        Exec & Orig
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* 3. Tab Content Area — no swipe; tabs change on tap only */}
+                  <div className="min-h-[300px] pt-1" data-testid="mobile-tab-content">
+                                {activeMobileTab === 'difficulty' && (
+                        <div key="tab-difficulty" className="rounded-2xl border p-4 space-y-4 bg-surface-sunken border-line">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <h3 className="type-display-s text-fg">Difficulty Elements</h3>
+                              <p className="text-xs text-fg-muted mt-0.5">Select counts for Class A, B, and C elements</p>
+                            </div>
+                            <span className="text-xs px-2.5 py-1 rounded-full font-bold bg-surface-raised text-fg">Max 3.80</span>
+                          </div>
+
+                          <div className="space-y-5 pt-1">
+                            {DIFFICULTY_CLASSES.map(([key, cls, value]) => (
+                              <DifficultyPicker key={key} cls={cls} value={value} count={scores.difficulty[key]}
+                                points={difficultyResolved[cls]} max={difficultyMax[cls]}
+                                onChange={v => handleDifficulty(key, v)} />
+                            ))}
+                          </div>
+
+                          <div className="flex items-center justify-between pt-3 border-t border-ink/5">
+                            <span className="text-xs font-bold text-fg-muted">Difficulty Subtotal</span>
+                            <span className="text-xl font-black" style={{ color: Math.abs(scores.difficulty.total - 3.80) < 0.01 ? FG.success : FG.warning }}>
+                              {scores.difficulty.total.toFixed(2)} <span className="text-xs font-normal text-fg-muted">/ 3.80</span>
+                            </span>
+                          </div>
+
+                          <button onClick={() => setShowCopModal(true)} className="w-full flex items-center justify-center gap-2 py-3 min-h-[44px] rounded-xl border text-xs font-bold transition-all duration-200 mt-2" style={{ borderColor: 'rgb(var(--accent) / 0.3)', color: 'rgb(var(--accent-fg))', background: 'rgb(var(--accent) / 0.06)' }}>
+                            <BookOpen className="w-3.5 h-3.5" aria-hidden="true" /> View COP Rules Reference
+                          </button>
+                        </div>
+                      )}
+
+                      {activeMobileTab === 'combination' && (
+                        <div key="tab-combination" className="rounded-2xl border p-4 space-y-4 bg-surface-sunken border-line">
+                          <div className="flex items-center justify-between gap-2">
+                            <div>
+                              <h3 className="type-display-s text-fg">Combination Requirements</h3>
+                              <p className="text-xs text-fg-muted mt-0.5 truncate">{selectedApparatus || 'Pole Mallakhamb'}</p>
+                            </div>
+                            <span className="text-xs px-2.5 py-1 rounded-full font-bold flex-shrink-0 bg-surface-raised text-fg">Max 1.60</span>
+                          </div>
+
+                          <div className="space-y-2 pt-1">
+                            <SelectAllRow metCount={combinationMet} itemCount={combinationChecklist.length}
+                              onChange={handleCombinationAll} />
+                            {combinationChecklist.map((item) => (
+                              <CheckRow key={item.id} checked={scores.combination.checked[item.id]}
+                                onChange={() => handleCombination(item.id)} label={item.rule} penalty={item.penalty} />
+                            ))}
+                          </div>
+
+                          <div className="flex items-center justify-between pt-3 border-t border-ink/5">
+                            <span className="text-xs font-bold text-fg-muted">Combination Subtotal</span>
+                            <span className="text-xl font-black text-fg-secondary">
+                              {scores.combination.total.toFixed(2)} <span className="text-xs font-normal text-fg-muted">/ 1.60</span>
+                            </span>
+                          </div>
+
+                          <button onClick={() => setShowCopModal(true)} className="w-full flex items-center justify-center gap-2 py-3 min-h-[44px] rounded-xl border text-xs font-bold transition-all duration-200 mt-2" style={{ borderColor: 'rgb(var(--accent) / 0.3)', color: 'rgb(var(--accent-fg))', background: 'rgb(var(--accent) / 0.06)' }}>
+                            <BookOpen className="w-3.5 h-3.5" aria-hidden="true" /> View COP Rules Reference
+                          </button>
+                        </div>
+                      )}
+
+                      {activeMobileTab === 'exec_orig' && (
+                        <div key="tab-exec_orig" className="space-y-4">
+                          {/* Execution Card */}
+                          <div className="rounded-2xl border p-4 space-y-3 bg-surface-sunken border-line">
+                            <div className="flex items-center justify-between">
+                              <h3 className="type-display-s text-fg">Execution Score</h3>
+                              <span className="text-xs px-2.5 py-1 rounded-full font-bold bg-surface-raised text-fg">Max 4.40</span>
+                            </div>
+                            <ScoreInput label="" ariaLabel="Execution" value={scores.execution}
+                              onChange={raw => setScores({ ...scores, execution: roundExecution(raw) })} />
+                          </div>
+
+                          {/* Originality Card */}
+                          <div className="rounded-2xl border p-4 space-y-3 bg-surface-sunken border-line">
+                            <div className="flex items-center justify-between">
+                              <h3 className="type-display-s text-fg">Originality Bonus</h3>
+                              <span className="text-xs px-2.5 py-1 rounded-full font-bold bg-surface-raised text-fg">Max 0.20</span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                              {[['None', 0], ['+0.20', POINT_CEILINGS.bonus]].map(([label, val]) => {
+                                const active = Math.abs((scores.bonus || 0) - val) < 1e-6;
+                                return (
+                                  <button key={label} type="button"
+                                    disabled={competitionLocked}
+                                    onClick={() => setScores({ ...scores, bonus: val })}
+                                    className="py-3 rounded-xl border font-bold text-sm transition-all duration-200 min-h-[46px]"
+                                    style={{
+                                      background: active ? 'rgb(var(--accent) / 0.15)' : 'rgb(var(--ink) / 0.03)',
+                                      borderColor: active ? J.purple : 'rgb(var(--ink) / 0.08)',
+                                      color: active ? FG.ink : 'rgb(var(--ink) / 0.5)',
+                                    }}>
+                                    {label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Summary Card */}
+                          <div className="rounded-2xl border p-4 space-y-1 bg-surface-sunken border-line">
+                            <h3 className="type-tag text-fg-secondary mb-2">Overall Score Breakdown</h3>
+                            <ScoreRow label="1. Difficulty" value={scores.difficulty.total} max="3.80" />
+                            <ScoreRow label="2. Combination" value={scores.combination.total} max="1.60" />
+                            <ScoreRow label="3. Execution" value={parseFloat(scores.execution || 0)} max="4.40" />
+                            <ScoreRow label="4. Originality" value={parseFloat(scores.bonus || 0)} max="0.20" />
+                          </div>
+
+                          <button onClick={() => setShowCopModal(true)} className="w-full flex items-center justify-center gap-2 py-3 min-h-[44px] rounded-xl border text-xs font-bold transition-all duration-200" style={{ borderColor: 'rgb(var(--accent) / 0.3)', color: 'rgb(var(--accent-fg))', background: 'rgb(var(--accent) / 0.06)' }}>
+                            <BookOpen className="w-3.5 h-3.5" aria-hidden="true" /> View COP Rules Reference
+                          </button>
+                        </div>
+                      )}
+                              </div>
+                </div>
+
+                {/* ─── DESKTOP VIEW (hidden on mobile, lg:grid) ─── */}
+                <div key="scoring-desktop" className="hidden lg:grid grid-cols-[1.6fr_1fr] gap-5 min-h-[calc(100dvh-80px)]">
+                  {/* Left Column: Scoring Controls */}
+                  <div className="flex flex-col gap-4 order-1">
+                    {/* Score hero */}
+                    {/* The total: the lower third (3px rule), num-l, saffron at full marks. */}
+                    <div className="ui-panel ui-panel--feature p-6 flex flex-col items-center justify-center">
+                      <p className="type-tag mb-2 text-fg-secondary">Final Score</p>
+                      <p className={`type-num-l m-0 ${parseFloat(calcFinal()) >= 10 ? 'text-accent-fg' : 'text-fg'}`} key={calcFinal()}>
+                        {calcFinal()}
+                      </p>
+                      <p className="text-sm relative z-10 mt-1 text-fg-muted">out of 10.00</p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="rounded-2xl border p-4 bg-surface-sunken border-line">
+                        <div className="flex items-center justify-between mb-3">
+                          <h3 className="type-tag text-fg-secondary">Execution</h3>
+                          <span className="text-xs px-2 py-1 rounded-full bg-surface-raised text-fg">Max 4.40</span>
+                        </div>
+                        <ScoreInput label="" ariaLabel="Execution" value={scores.execution}
+                          onChange={raw => setScores({ ...scores, execution: roundExecution(raw) })} />
+                      </div>
+
+                      <div className="rounded-2xl border p-4 bg-surface-sunken border-line">
+                        <div className="flex items-center justify-between mb-3">
+                          <h3 className="type-tag text-fg-secondary">Originality</h3>
+                          <span className="text-xs px-2 py-1 rounded-full bg-surface-raised text-fg">0.20</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          {[['None', 0], ['+0.20', POINT_CEILINGS.bonus]].map(([label, val]) => {
+                            const active = Math.abs((scores.bonus || 0) - val) < 1e-6;
+                            return (
+                              <button key={label} type="button"
+                                disabled={competitionLocked}
+                                    onClick={() => setScores({ ...scores, bonus: val })}
+                                className="py-3 rounded-xl border font-bold text-sm transition-all duration-200 min-h-[44px]"
+                                style={{
+                                  background: active ? 'rgb(var(--accent) / 0.15)' : 'rgb(var(--ink) / 0.03)',
+                                  borderColor: active ? J.purple : 'rgb(var(--ink) / 0.08)',
+                                  color: active ? FG.ink : 'rgb(var(--ink) / 0.5)',
+                                }}>
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border p-4 flex-1 bg-surface-sunken border-line">
+                      <div className="flex items-center justify-between mb-3 gap-2">
+                        <div className="min-w-0">
+                          <h3 className="type-tag text-fg-secondary">Combination</h3>
+                          <p className="text-xs mt-0.5 truncate text-fg-muted">{selectedApparatus || 'Pole Mallakhamb'}</p>
+                        </div>
+                        <span className="text-xs px-2 py-1 rounded-full flex-shrink-0 bg-surface-raised text-fg">Max 1.60</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <SelectAllRow metCount={combinationMet} itemCount={combinationChecklist.length}
+                          onChange={handleCombinationAll} className="col-span-2" />
+                        {combinationChecklist.map((item) => (
+                          <CheckRow key={item.id} checked={scores.combination.checked[item.id]}
+                            onChange={() => handleCombination(item.id)} label={item.rule} penalty={item.penalty} />
+                        ))}
+                      </div>
+                      <div className="flex justify-end pt-2">
+                        <span className="text-lg font-black text-fg-secondary">
+                          {scores.combination.total.toFixed(2)} <span className="text-xs font-normal text-fg-muted">/ 1.60</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right Column: Summary & Submit (desktop difficulty) */}
+                  <div className="flex flex-col gap-4 order-2">
+                    <div className="rounded-2xl border p-4 space-y-3 bg-surface-sunken border-line">
+                      <div className="flex items-center justify-between">
+                        <h3 className="type-tag text-fg-secondary">Difficulty</h3>
+                        <span className="text-xs px-2 py-1 rounded-full bg-surface-raised text-fg">Max 3.80</span>
+                      </div>
+                      <div className="space-y-4">
+                        {DIFFICULTY_CLASSES.map(([key, cls, value]) => (
+                          <DifficultyPicker key={key} cls={cls} value={value} count={scores.difficulty[key]}
+                                points={difficultyResolved[cls]} max={difficultyMax[cls]}
+                            onChange={v => handleDifficulty(key, v)} />
+                        ))}
+                      </div>
+                      <div className="flex justify-end">
+                        <span className="text-lg font-black" style={{ color: Math.abs(scores.difficulty.total - 3.80) < 0.01 ? FG.success : FG.warning }}>
+                          {scores.difficulty.total.toFixed(2)} <span className="text-xs font-normal text-fg-muted">/ 3.80</span>
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border p-4 space-y-1 bg-surface-sunken border-line">
+                      <h3 className="type-tag text-fg-secondary mb-2">Score Summary</h3>
+                      <ScoreRow label="1. Difficulty" value={scores.difficulty.total} max="3.80" />
+                      <ScoreRow label="2. Combination" value={scores.combination.total} max="1.60" />
+                      <ScoreRow label="3. Execution" value={parseFloat(scores.execution || 0)} max="4.40" />
+                      <ScoreRow label="4. Originality" value={parseFloat(scores.bonus || 0)} max="0.20" />
+                    </div>
+
+                    {/* Desktop submit */}
+                    <div className="flex flex-col gap-3">
+                      <button onClick={submitScore} disabled={submitting || !isConnected || submitted || competitionLocked}
+                        aria-disabled={executionMissing || undefined}
+                        className="w-full py-4 rounded-2xl font-black text-base flex items-center justify-center gap-3 min-h-[56px] relative overflow-hidden" style={{
+                          background: submitted ? 'rgb(var(--success-fill))' : 'rgb(var(--accent))', color: submitted ? 'rgb(var(--success-on))' : 'rgb(var(--on-accent))',
+                          opacity: (!isConnected || submitting || (executionMissing && !submitted)) ? 0.5 : 1,
+                          cursor: executionMissing && !submitted ? 'not-allowed' : undefined,
+                        }}>
+                        <AnimatePresence mode="wait" initial={false}>
+                          {submitting ? (
+                            <span key="submitting" className="flex items-center gap-2">
+                              <div className="w-5 h-5 rounded-full border-2 border-ink/30 border-t-ink"/>
+                              Submitting...
+                            </span>
+                          ) : submitted ? (
+                            <span key="done" className="flex items-center gap-2">
+                              <CheckCircle className="w-5 h-5" aria-hidden="true" /> Score Submitted!
+                            </span>
+                          ) : (
+                            <span key="idle" className="flex items-center gap-2">
+                              <Send className="w-5 h-5" aria-hidden="true" />
+                              {panelScores[judgeInfo?.judgeType] ? 'Resubmit Score' : 'Submit Score'}
+                            </span>
+                          )}
+                        </AnimatePresence>
+                      </button>
+                      {!isConnected && (
+                        <p className="text-center text-xs text-danger-fg">
+                          Not connected to server. Scores cannot be submitted.
+                        </p>
+                      )}
+                      <button onClick={() => setShowCopModal(true)} className="flex items-center justify-center gap-2 py-2.5 rounded-xl border text-xs font-bold transition-all duration-200" style={{ borderColor: 'rgb(var(--accent) / 0.3)', color: 'rgb(var(--accent-fg))', background: 'rgb(var(--accent) / 0.06)' }}>
+                        <BookOpen className="w-3.5 h-3.5" aria-hidden="true" /> COP Rules
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+            {/* Mobile sticky submit bar */}
+              <div className="lg:hidden fixed bottom-0 inset-x-0 z-50 p-3 border-t"
+                style={{
+                  background: 'rgb(var(--bg) / 0.96)',
+                  backdropFilter: 'blur(16px)',
+                  borderColor: 'rgb(var(--accent) / 0.2)',
+                  paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
+                }}>
+                <div className="max-w-[1400px] mx-auto flex items-center gap-3">
+                  <div className="flex-shrink-0 text-center px-2">
+                    <p className="type-tag text-fg-secondary m-0">Total</p>
+                    <p className={`type-num-m leading-none m-0 ${parseFloat(calcFinal()) >= 10 ? 'text-accent-fg' : 'text-fg'}`}>{calcFinal()}</p>
+                  </div>
+                  <button onClick={submitScore} disabled={submitting || !isConnected || submitted || competitionLocked}
+                    aria-disabled={executionMissing || undefined}
+                    className="flex-1 py-3.5 rounded-2xl font-black text-sm flex items-center justify-center gap-2 min-h-[52px]" style={{
+                      background: submitted ? 'rgb(var(--success-fill))' : 'rgb(var(--accent))', color: submitted ? 'rgb(var(--success-on))' : 'rgb(var(--on-accent))',
+                      opacity: (!isConnected || submitting || competitionLocked || (executionMissing && !submitted)) ? 0.5 : 1,
+                      cursor: executionMissing && !submitted ? 'not-allowed' : undefined,
+                    }}>
+                    {submitting ? 'Submitting…' : submitted ? (
+                      <><CheckCircle className="w-4 h-4" aria-hidden="true" /> Submitted</>
+                    ) : (
+                      <><Send className="w-4 h-4" aria-hidden="true" /> {panelScores[judgeInfo?.judgeType] ? 'Resubmit' : 'Submit Score'}</>
+                    )}
+                  </button>
+                </div>
+                {!isConnected && (
+                  <p className="text-center text-[10px] mt-1.5 text-danger-fg">
+                    Offline — cannot submit
+                  </p>
+                )}
+              </div>
+
+
+        </div>
+        </SlipReadOnly.Provider>
+      </main>
+
+      {/* Modals */}
+      <CopPdfModal isOpen={showCopModal} onClose={() => setShowCopModal(false)} />
+      <ConfirmDialog open={confirmAbsent} onClose={() => setConfirmAbsent(false)} onConfirm={markAbsent}
+        tone="danger" confirmText="Mark Absent" title={`Mark ${selectedPlayer.name} absent?`}>
+        Every judge&apos;s score, the time and every deduction are saved as 0, and the final score is 0.00.
+        The athlete is locked for the whole panel; only the admin can reopen them.
+      </ConfirmDialog>
+    </div>
+  );
+};
+
+/**
+ * Hook-free dispatcher for /judge/scoring (fixes HIGH-W1).
+ *
+ * Picks the Scorer view or the judge slip BEFORE any of the hooks inside
+ * `JudgeSlip` run. `useLocation` is the only hook here and is called
+ * unconditionally on every render, so this component's own hook sequence is
+ * always identical. Flipping `isScorer` swaps which CHILD is rendered, and
+ * React unmounts one and mounts the other — a clean remount rather than a
+ * hook-order violation on a single instance.
+ */
+const JudgeScoring = () => {
+  const location = useLocation();
+
+  // Read straight through rather than via useMemo. The previous `useMemo(..., [])`
+  // cached a value read once at mount, so if `secureStorage.getItem` later
+  // evicted an entry it could not decrypt, `isScorer` could change between
+  // renders of the same instance — the exact trigger described in AUDIT.md
+  // HIGH-W1. Reading on every render keeps the branch consistent with storage.
+  let storedJudgeUser = null;
+  try {
+    const raw = secureStorage.getItem('judge_user');
+    storedJudgeUser = raw ? JSON.parse(raw) : null;
+  } catch {
+    storedJudgeUser = null;
+  }
+
+  // The Time Keeper is routed by the seat held in the chosen category (the
+  // dashboard sets `isTimeKeeper`); a stored primary seat covers a refresh
+  // that lost the navigation state.
+  // The navigation state is the dashboard's per-category answer and wins — for
+  // a person seated as both Scorer and Time Keeper it carries the role they
+  // chose in the dashboard's role popup. The stored primary seat only covers a
+  // refresh that lost the state.
+  const primary = storedJudgeUser?.judgeType;
+  const isScorer = location.state?.isScorer
+    || (!location.state?.isTimeKeeper && primary === 'Scorer');
+  const isTimeKeeper = !isScorer
+    && (location.state?.isTimeKeeper || primary === 'Time Keeper');
+
+  if (isTimeKeeper) return <TimeKeeperScoring />;
+  return isScorer ? <ScorerScoring /> : <JudgeSlip />;
+};
+
+export default JudgeScoring;
+

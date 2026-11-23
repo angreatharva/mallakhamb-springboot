@@ -1,0 +1,374 @@
+---
+doc: 05-API-SURFACE
+covers:
+  - src/routes/**
+  - src/controllers/**
+  - src/validators/**
+  - src/docs/openapi.js
+  - src/docs/api-enums.js
+read_when: "adding/changing any HTTP endpoint, or checking what auth/lock/validator a route already has"
+depends_on: [01-ARCHITECTURE, 06-AUTH-AND-SECURITY]
+verified_against_commit: f5465b4
+last_verified: 2026-11-11
+---
+
+## Coverage check (per the build instructions' verification step)
+
+Grepping `router\.(get|post|put|patch|delete)\(` across every `src/routes/*.js`
+file yields **221** route definitions (2026-10-21; was 186 on 2026-10-18 —
++35 for the account page, account requests, coach-registered players and the
+walk-in desk); `src/routes/index.js` additionally
+registers **2 more directly on `apiRouter`** (`GET /health-legacy`, `GET
+/csrf-token`) that the per-file grep misses — **223 routes total**, each also
+served at both `/api/...` and `/api/v1/...` (see
+[01-ARCHITECTURE.md](01-ARCHITECTURE.md)). `src/docs/openapi.js` documents
+**221** operations, and `npm run docs:openapi:check` (live Express stack vs.
+spec) reports 221/221 with no drift (re-run 2026-10-21). The 2-route gap is exactly `docs.routes.js`'s own two
+endpoints (`GET /api/docs`, `GET /api/docs/openapi.json`), which are
+self-referential and correctly excluded from the spec by design. Every other
+route was spot-checked path-by-path and method-by-method against the OpenAPI
+document with no mismatch. `openapi.js` is **hand-written spec source** (a JS
+module, not generated from the route files) — but its enum values
+(`AGE_GROUPS`, `GENDERS`, `APPARATUS`, `JUDGE_TYPES`, `COMPETITION_TYPES`)
+are imported live from `src/docs/api-enums.js`, which pulls them off the
+actual Mongoose schema enums and `config/cop-rules.js` rather than being
+retyped — so enum drift is structurally prevented even though path coverage
+is not automatically generated (a documented CI diff script,
+`scripts/generateOpenApi.js` vs. `scripts/perf/extract-routes.js`, is meant
+to catch path drift). `docs.routes.js` (the Swagger UI itself) is mounted
+only when `NODE_ENV!=='production' && ENABLE_API_DOCS==='true'` — see
+[06-AUTH-AND-SECURITY.md](06-AUTH-AND-SECURITY.md)-adjacent rationale: the
+document is a complete map of every route/role/header, and publishing it
+anonymously hands that map to everyone.
+
+`GET /api/debug/cors`, `GET /api/debug/env` (gated on `ENABLE_DEBUG_ROUTES`,
+never in production) and the root `GET /` info route live in
+`createApp.js` directly, outside `src/routes/`, and are correctly absent
+from the OpenAPI spec.
+
+## Full route table
+
+Paths shown unversioned; every row also lives at `/api/v1/...`. "Auth"
+column: `public` = no `authMiddleware`; role names = `requireX` guard;
+`context` = `validateCompetitionContext`; `unlocked` =
+`requireUnlockedCompetition()` (optionally with `{param}`/`{scoreParam}`
+noted). Full semantics of context/lock/rate-limit guards:
+[06-AUTH-AND-SECURITY.md](06-AUTH-AND-SECURITY.md).
+
+### Health — `/api/health` (no auth)
+| Method | Path | Controller |
+|---|---|---|
+| GET | `/live` | healthController.liveness |
+| GET | `/ready` | healthController.readiness |
+| GET | `` (`/api/health`) | healthController.health |
+| GET | `/api/health-legacy` | inline in `routes/index.js` |
+
+### Auth — `/api/auth`
+| Method | Path | Auth | Rate limit | Controller |
+|---|---|---|---|---|
+| GET | `/api/csrf-token` | public | — | inline `csrfTokenHandler` |
+| POST | `/forgot-password` | public | `authLimiter` (IP) | authController.forgotPassword — always 200, no enumeration; body `{identifier, userType?}` (`identifier` = email or Player ID; the old `email` field is still read). A no-email player's Player ID opens a coach-approval request instead |
+| POST | `/verify-otp` | public | `authLimiter` | authController.verifyOTP — `{identifier, otp, userType?}` |
+| POST | `/reset-password-otp` | public | `authLimiter` | authController.resetPasswordWithOTP — `{identifier, otp, password, userType?}` |
+| POST | `/reset-password-coach` | public | — | accountRequestController.completePasswordReset — `{identifier (Player ID), code, password}`; the code the coach was shown. [modules/accounts.md](modules/accounts.md) |
+| POST | `/set-competition` | authMiddleware | — | authController.setCompetition |
+| GET | `/competitions/assigned` | authMiddleware | — | authController.getAssignedCompetitions |
+| GET | `/me` | authMiddleware | — | authController.me |
+| GET | `/me/account` | authMiddleware | — | authController.getAccount — profile + pending email change, every role |
+| PUT | `/me` | authMiddleware | — | authController.updateAccount — `account.validator#updateMe`; fields outside the role's `EDITABLE_FIELDS` are ignored |
+| PUT | `/me/password` | authMiddleware | — | authController.changePassword — signs other sessions out, sets new cookies |
+| POST | `/me/email` | authMiddleware | — | authController.requestEmailChange — code to the new address |
+| POST | `/me/email/confirm` | authMiddleware | — | authController.confirmEmailChange |
+| DELETE | `/me/email` | authMiddleware | — | authController.cancelEmailChange |
+| POST | `/logout` | authMiddleware | — | authController.logout |
+| POST | `/refresh` | public (refresh-token cookie) | — | authController.refresh |
+
+`POST /reset-password/:token` was **removed** 2026-10-07 (it reset any
+account with a pending code, no email needed). See
+[06-AUTH-AND-SECURITY.md](06-AUTH-AND-SECURITY.md).
+
+`authLimiter` used to wrap the entire `/auth` router; narrowed to just these
+4 guessable endpoints after it was found to lock out a whole venue's judge
+panel (shared NAT) via `/me`+`/set-competition` traffic.
+
+### Players — `/api/players` (whole prefix also gets `userLimiter`)
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | `/register` | public, `authLimiter` | `playerValidators.createPlayer()` |
+| POST | `/login` | public, `authLimiter` | `accountIdentifier()` — own email **or Player ID** |
+| GET | `/profile` | requirePlayer | |
+| GET | `/teams` | requirePlayer | no competition context required; `competitionId` query param is **silently discarded** by the service, see GOTCHAS.md |
+| GET | `/competitions/open` | requirePlayer | resolves `competitionService` directly, not via playerService |
+| GET | `/team` | requirePlayer, context | |
+| POST | `/team/join` | requirePlayer, unlocked | `playerValidators.joinTeam()` |
+
+### Coaches — `/api/coaches` (whole prefix also gets `userLimiter`)
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | `/register` | public, `authLimiter` | inline validation — **password complexity NOT enforced** (only length ≥8), unlike player registration which uses the complexity-checking `common.validator.password()`; see GOTCHAS.md |
+| POST | `/login` | public, `authLimiter` | |
+| GET | `/profile`, `/status` | requireCoach | |
+| POST | `/team` | requireCoach | no competition context needed |
+| GET | `/teams` | requireCoach | no competition context needed |
+| GET | `/competitions/open` | requireCoach | |
+| POST | `/select-competition` | requireCoach, unlocked | |
+| POST | `/team/:teamId/register-competition` | requireCoach, unlocked | |
+| GET | `/competition/team-status` | requireCoach, context | |
+| GET | `/dashboard` | requireCoach, context | |
+| GET | `/search-players` | requireCoach, context | |
+| POST | `/add-player` | requireCoach, context, unlocked | apparatus validator accepts string\|array\|per-type object, all shapes |
+| DELETE | `/remove-player/:playerId` | requireCoach, context, unlocked | |
+| POST | `/payments/create-order` | requireCoach, context, unlocked | |
+| POST | `/payments/verify-and-submit` | requireCoach, context, unlocked | |
+| POST | `/payments/discount/validate` | requireCoach, `userRateLimit`, context, unlocked | rate-limited — a discount-code guessing surface |
+| POST | `/payments/discount/redeem` | requireCoach, `userRateLimit`, context, unlocked | |
+| GET | `/account-requests` | requireCoach | resets / email additions from no-email players on this coach's teams |
+| POST | `/account-requests/:requestId/approve`, `/reject` | requireCoach | approve of a reset returns a one-time code |
+| GET | `/player-default-password` | requireCoach | decrypted; `{isSet, readable, password, setAt}` |
+| PUT | `/player-default-password` | requireCoach, `userRateLimit` | `{password, currentPassword}` |
+| POST | `/players` | requireCoach, `userRateLimit` | register a no-email player onto the coach's team; 409 `POSSIBLE_DUPLICATE` unless `confirmDuplicate`. Not competition-scoped |
+
+### Walk-in desk — `/api/desk` (Admin + Super Admin; scope and end-date lock checked in the SERVICE against the draft's meet) — [modules/walk-in-desk.md](modules/walk-in-desk.md)
+`GET /meets`, `GET /ocr/status`, `GET /coaches?q=` (search name/phone/email/
+team, ≤10) or `?email=` (exact), `POST /coaches`, `PUT /coaches/:coachId/player-default-password`,
+`POST /coaches/:coachId/team`, `GET /form` (PDF), `GET|POST /drafts`,
+`GET|DELETE /drafts/:draftId`, `POST /drafts/:draftId/scan` (raw image, 8 MB),
+`PUT /drafts/:draftId/rows`, `POST /drafts/:draftId/submit`,
+`POST /drafts/:draftId/payment/{order,verify}`,
+`POST /drafts/:draftId/payment/discount/quote` and `/discount` (`userRateLimit`),
+`GET /drafts/:draftId/slip`. 19 routes.
+
+### Admin — `/api/admin` (full write-flow trace: [modules/competition.md](modules/competition.md) and [06-AUTH-AND-SECURITY.md](06-AUTH-AND-SECURITY.md); service internals: [modules/user-services.md](modules/user-services.md))
+| Method | Path | Auth chain |
+|---|---|---|
+| POST | `/register` | auth, requireSuperAdmin |
+| POST | `/login` | public |
+| GET | `/dashboard`, `/dashboard/stats` | authorize(admin), context |
+| GET | `/system/health` | authorize |
+| GET | `/teams/submitted`, `/teams` | authorize, context (list only) |
+| GET | `/teams/:teamId` | authorize |
+| PUT | `/teams/:teamId/approve`, `/reject` | authorize, unlocked |
+| GET | `/players`, `/players/:playerId` | authorize (+context on list) |
+| PUT | `/players/:playerId/status`, `/team` | authorize, unlocked |
+| POST | `/judges/bulk` | authorize, context, unlocked |
+| GET | `/judge-accounts` | authorize |
+| GET | `/judges/summary`, `/judges` | requireAdminOrScorer, context |
+| POST/PUT/DELETE | `/judges(/:judgeId)` | authorize, context, unlocked, audit middleware |
+| PUT | `/scores/:scoreId/unlock` | authorize, context, unlocked |
+| PUT | `/scores/lock` | authorize, context, unlocked |
+| GET | `/scores/team`, `/individual` | authorize, context |
+| POST | `/scores/save` | authorize, context, unlocked — no body validator, see [07-SCORING-ENGINE.md](07-SCORING-ENGINE.md) |
+| GET | `/rankings/team`, `/scores/team-rankings` (alias), `/rankings/individual` | authorize, context |
+| POST | `/scores/recalculate` | authorize, context, unlocked |
+| GET/POST/PUT | `/lots`, `/lots/draw`, `/lots/teams`, `/lots/players` | authorize, context (+unlocked on writes) |
+| POST/DELETE | `/tie-break/draws` | authorize, context, unlocked, `tieBreakDrawValidator.{recordDraw,clearDraw}` → `tieBreakDrawController` — record / clear a physical lucky draw (COP 1.12.4); body = category + `apparatus` + `order[]` (2–100 ids) or `groupKey`. See [07-SCORING-ENGINE.md](07-SCORING-ENGINE.md) |
+| POST | `/age-groups/start`, `/age-groups/:ageGroup/end` | authorize, context, unlocked |
+| GET | `/age-groups/status` | authorize, context |
+| GET | `/transactions`, `/transactions/summary`, `/transactions/:transactionId` | authorize, context |
+
+### Superadmin — `/api/superadmin` (blanket `auth+requireSuperAdmin` on everything after `/login`)
+Only `POST /login` sits ahead of the blanket guard. Heavily **reuses other
+controllers' handlers**, not `superAdminController`, for anything that
+mirrors an admin capability:
+- Score/ranking/lot-draw/lucky-draw/judge-management block →
+  `adminController.*` / `performanceOrderController.*` /
+  `tieBreakDrawController.*` (same handlers as `/api/admin`, but **without**
+  `validateCompetitionContext` on the lot-draw and `/tie-break/draws` routes —
+  a superadmin isn't scoped to one competition and must send `competitionId`
+  (or `competition`) explicitly; `competitionIdFromRequest` reads either).
+- Genuinely `superAdminController`-owned: login; player payment
+  create/verify/add; admin CRUD; coach list+status; team list/details/delete;
+  `judges/:judgeId` DELETE only; competition full CRUD + admin
+  assign/remove; system stats/dashboard/transactions.
+- `GET /account-requests`, `POST /account-requests/:requestId/approve|reject`
+  → `accountRequestController.superAdmin.*` — every open no-email-player
+  request **except** coach-registered players' (those are the coach's alone).
+- `PUT /coaches/:coachId/status` now **refuses `isActive:false`** — coaches
+  cannot be deactivated (2026-10, `06b6b0d`).
+- Two age-group-start aliases (`/competition/age-group/start` and
+  `/age-groups/start`) both → `adminController.startAgeGroup`, mirroring the
+  admin router's own alias pair.
+
+### Judge — `/api/judge` (full trace: [07-SCORING-ENGINE.md](07-SCORING-ENGINE.md))
+| Method | Path | Auth |
+|---|---|---|
+| POST | `/login` | public, `judgeLoginLimiter` (username-keyed) |
+| POST | `/register` | public |
+| GET/PUT | `/profile`, PUT `/profile/password` | requireJudge |
+| GET | `/assignments`, `/competitions` | requireJudge |
+| GET/PUT | `/competition/:competitionId(/set)` | requireJudge |
+| GET | `/teams/:teamId/players` | requireJudge |
+| GET | `/scores/team`, `/judges`, `/judges/summary` | requireJudge, context — reuses adminController |
+| POST | `/scores/save` | requireJudge, unlocked — no context, narrower per-payload check instead |
+| GET | `/lots` | requireJudge — any panel judge |
+| PUT | `/lots/teams`, `/lots/players` | requireJudge, requireSequenceManager, unlocked |
+
+### Public — `/api/public`
+| Method | Path | Auth |
+|---|---|---|
+| GET | `/competitions` | public |
+| GET | `/cop-rules` | public — strong caching (ETag + `Cache-Control: max-age=3600`) |
+| GET | `/judges` | authenticate + `requireScoringAccess` — **not actually public despite the path** |
+| GET | `/submitted-teams` | authenticate + `requireScoringAccess` — **not actually public** |
+| GET | `/teams` | public — `SUBMITTED_TEAM_PLAYER_FIELDS` allow-list only |
+| GET | `/scores` | public — `competitionId` required; two-gate publish rule (`isFinalized` AND locked/`lockedApparatus`) |
+| GET | `/team-championship` | public — `competitionId` + `gender` + `ageGroup` required; Competition I team standing (best 3 / best 5 per apparatus) built on the same published scores as `/scores` — see [modules/public.md](modules/public.md) |
+| POST | `/save-score` | authenticate + `requireScoringAccess`, unlocked — **the path the deployed judge client actually posts to** |
+| POST | `/payments/razorpay/webhook` | public, HMAC-verified — deliberately not behind the lock, see [09-PAYMENTS.md](09-PAYMENTS.md) |
+
+`publicController.getPublicRankings`/`publicService.getPublicRankings` exist
+but **no route mounts them** — dead/unreachable code, confirmed by reading
+the whole router file.
+
+### Competitions — `/api/competitions` (whole prefix also gets `userLimiter`)
+| Method | Path | Auth | Lock guard |
+|---|---|---|---|
+| POST | `` | requireAdmin | — |
+| GET | `` | authMiddleware | — |
+| GET | `/upcoming` | public | — |
+| GET | `/status/:status` | authMiddleware | — |
+| GET | `/:id` | authMiddleware | — |
+| PUT | `/:id` | requireAdmin | `{param:'id'}` |
+| DELETE | `/:id` | requireAdmin | `{param:'id'}` |
+| PATCH | `/:id/status` | requireAdmin | `{param:'id'}` |
+| POST | `/:competitionId/register` | requireCoach | `{param:'competitionId'}` |
+| DELETE | `/:competitionId/register/:teamId` | requireCoach | `{param:'competitionId'}` |
+| POST | `/:competitionId/teams/:teamId/players` | requireCoach | `{param:'competitionId'}` |
+| DELETE | `/:competitionId/teams/:teamId/players/:playerId` | requireCoach | `{param:'competitionId'}` |
+| GET | `/:competitionId/teams/:teamId` | authMiddleware | — |
+| GET | `/:competitionId/registrations` | requireAdmin | — |
+| POST | `/:id/admins` | requireAdmin | `{param:'id'}` — fixed 2026-09-23, see [modules/competition.md](modules/competition.md) |
+| DELETE | `/:id/admins/:adminId` | requireAdmin | `{param:'id'}` — fixed 2026-09-23, same doc |
+
+### Teams — `/api/teams` (whole prefix also gets `userLimiter`)
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| GET | `` | authMiddleware, requireCoach | despite the generic name, coach-scoped (`getTeamsByCoach`) |
+| GET | `/:id` | authMiddleware only, **no role restriction** | deliberate — admins/superadmins/judges legitimately read team detail; narrowed payload fixes a prior CRIT-level PII-chain issue (see below) |
+| GET | `/:id/stats` | authMiddleware only | same history |
+| POST | `` | authMiddleware, requireCoach | |
+| PUT | `/:id` | authMiddleware, requireCoach | |
+| DELETE | `/:id` | authMiddleware, requireCoach | |
+| POST | `/:id/players` | authMiddleware, requireCoach | `body.playerId` |
+| DELETE | `/:id/players` | authMiddleware, requireCoach | id in the **body**, not a route param, even for DELETE |
+
+`GET /:id`/`GET /:id/stats` used to be unauthenticated entirely; combined
+with anonymous `GET /api/public/teams`, this formed a walkable chain to
+minors' roster PII — fixed by both requiring auth here **and** narrowing the
+response payload (`SUBMITTED_TEAM_PLAYER_FIELDS`-style allow-lists) in
+`TeamService.getTeamById`.
+
+### Docs — `/api/docs` (mounted only when `NODE_ENV!=='production' && ENABLE_API_DOCS==='true'`)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/openapi.json` | Built once at router-creation time from `openapi.js` |
+| GET | `` | Swagger UI HTML, CDN-loaded, `credentials:'include'` interceptor (API and SPA are different origins) |
+
+### Scoring — `/api/scoring`
+Unlike every other router, handlers are **inline `asyncHandler` closures**
+calling `scoringService` directly — no `scoringController` factory file
+exists.
+| Method | Path | Auth | Lock guard |
+|---|---|---|---|
+| POST | `` | requireJudge | unlocked |
+| GET | `/:scoreId` | authMiddleware | — |
+| PUT | `/:scoreId` | requireJudge | `{scoreParam:'scoreId'}` |
+| DELETE | `/:scoreId` | requireAdmin | `{scoreParam:'scoreId'}` |
+| GET | `/competition/:competitionId` | authMiddleware | — |
+| PATCH | `/:scoreId/lock`, `/unlock` | requireAdmin | `{scoreParam:'scoreId'}` |
+
+### Webhooks — `/api/webhooks`
+| Method | Path | Auth |
+|---|---|---|
+| POST | `/razorpay` | public, HMAC-verified — see [09-PAYMENTS.md](09-PAYMENTS.md) |
+
+## Shared validators — `src/validators/common.validator.js`
+
+`objectId`/`mongoId`, `email`, `accountIdentifier` (email or Player ID →
+`req.body.identifier`), `password` (≥8 chars **plus** upper+lower+digit
+regex), `phone` (10-15 digits after stripping punctuation, locale-agnostic
+by design), `pagination`, `dateRange`, `date`, `enumValue`, `string`
+(trim+length+`.escape()`), `number`, `boolean`, `array`. **Not every
+registration flow uses `password()`** — coach registration's inline
+validator only checks length, not complexity (see the Coaches table above
+and GOTCHAS.md).
+
+## Change guidance — adding a new endpoint
+
+1. Validator: add a function to the relevant `src/validators/*.validator.js`
+   file (reuse `common.validator.js` helpers), export it.
+2. Service: add the method to the owning service (see
+   [modules/user-services.md](modules/user-services.md),
+   [modules/repositories.md](modules/repositories.md) for where things
+   live).
+3. Controller: thin handler — parse params, call the service, shape the
+   `{success, data, message}` envelope.
+4. Route: register with the middleware chain in order — `authMiddleware` →
+   role guard → `validateCompetitionContext` (if competition-scoped and not
+   already proven via a route param) → `requireUnlockedCompetition()` (if a
+   write, unless it's identity/profile data) → validator → own audit
+   middleware if it's a sensitive op (see
+   [11-OBSERVABILITY.md](11-OBSERVABILITY.md)) → controller method.
+5. `openapi.js`: add the corresponding `add()`/`sa()` entry so
+   `docs:openapi:check` doesn't fail CI.
+
+## Open questions
+- None outstanding. `POST/DELETE /api/competitions/:id/admins(/:adminId)`
+  (once 500ing) were fixed 2026-09-23; `POST /auth/reset-password/:token`
+  was removed 2026-10-07.
+
+## Since the last pass (2026-10-30, against `4201319`)
+
+New routes (all through the usual auth/role middleware):
+
+- **Stats** `/api/stats`: `GET /player` (player), `/coach` (coach), `/judge`
+  (judge, `?competition=`), `/judge-fairness` (admin/superadmin) —
+  [modules/stats.md](modules/stats.md).
+- **Finals**: `/api/admin/finals` — `GET` list; `POST recompute`,
+  `finalize-all`, `:finalId/finalize`, `:finalId/withdraw`,
+  `:finalId/reinstate`, `:finalId/draw` (II tie order). `/api/superadmin/finals`
+  — the same with `competitionId` (query or body) **plus `:finalId/reopen`**
+  (Super Admin only). `GET /api/coaches/finals`, `GET /api/players/finals`,
+  `GET /api/public/finals?competitionId=` (finalized finals only).
+- **Super Admin Players**: `/api/superadmin/player-teams/` `players`
+  (search), `players/:playerId`, `players/:playerId/correct`,
+  `players/:playerId/remove-entries`, `conflicts`,
+  `conflicts/:conflictId/resolve`, `history`.
+- **Coach paper form**: `/api/coaches/paper-form/` `form`, `ocr/status`,
+  `draft` (GET/POST), `draft/:draftId` (GET/DELETE), `draft/:draftId/scan`,
+  `/rows`, `/submit`, `/slip` — the desk's WalkInService with a coach actor.
+- `POST /api/players/...join-team` now takes the level.
+
+## Since the last pass (2026-11-11, against `f5465b4`)
+
+- **Deleted: `/api/scoring`.** Any judge token could rewrite or lock any
+  score through it (audit C1).
+- Creating, editing, changing status of and deleting a meet, and assigning
+  admins to it, are **super admin only** (H1). Registration routes are
+  scoped by a new `requireCompetitionAccess` path guard.
+- A coach reads and acts on **only their own team entry** (H2/M3).
+- New owner correction routes under `/api/superadmin/`: `history`, `accounts`,
+  `fix/teams`, `fix/transfer`, `fix/scores`, `fix/entries`, and restoring
+  competitions. The table is in
+  [modules/superadmin-corrections.md](modules/superadmin-corrections.md).
+- New `PUT /api/{admin,superadmin}/scores/:scoreId/players/:playerId/unlock`
+  (body `{ apparatus }`). Like the whole-sheet `.../scores/:scoreId/unlock`,
+  it clears the Senior Judge's Final Submit and the Scorer's apparatus lock,
+  and broadcasts `unlocked`.
+- New `PUT /api/{admin,superadmin}/scores/:scoreId/players/:playerId/restore-edits`
+  (body `{ apparatus, judgeType? }`) restores a seat's 3-edit allowance, or
+  every seat's when there is no `judgeType`, and broadcasts `edits_restored`.
+- New `GET /api/coaches/co-coaches` and
+  `POST /api/coaches/co-coaches/:coachId/remove` (main coach only).
+- `PUT /judge/competition/:id/set` now returns that meet's seats along with
+  the token.
+- Coach paper form: `scanPage` and `saveRows` return **409** once the squad is
+  submitted, the same as submit. `GET /coaches/paper-form/draft` reports
+  whether the squad is submitted.
+- Single-slip submits (a judge's own slip) with Execution under 0.10, or with
+  no breakdown, get a **400**. Whole-panel writes (Final Submit, Scorer,
+  admin) are exempt.
+- The Senior Judge overriding another judge's slip now gets a **403**.
+- The `openapi.json` / `openapi.yaml` docs were updated with these changes.
+- A Scorer save with `isLocked: true` gets a **400** while any athlete in it
+  has no Senior Judge mark (2026-11-11).

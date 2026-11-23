@@ -1,0 +1,2847 @@
+/**
+ * OpenAPI 3.0 description of the whole HTTP surface.
+ *
+ * Written as a module rather than a static YAML file so that the enums that
+ * matter — age groups, apparatus, competition types, judge seats — are imported
+ * from the code that enforces them (config/cop-rules.js) instead of retyped.
+ * A COP revision then moves the spec with it; a hand-written YAML would go
+ * stale silently, and a wrong enum in an API document is worse than no document
+ * because it is believed.
+ *
+ * Coverage is not taken on trust either: `scripts/generateOpenApi.js` diffs the
+ * paths declared here against the routes read off the live Express stack
+ * (scripts/perf/extract-routes.js) and fails if either side has something the
+ * other does not.
+ *
+ * Every path is documented in its UNVERSIONED form (`/api/...`). The versioned
+ * alias `/api/v1/...` serves the identical router (routes/index.js) and is
+ * declared as a second server entry rather than as 185 duplicate paths.
+ *
+ * @module docs/openapi
+ */
+
+const { APPARATUS, COMPETITION_TYPES, AGE_GROUPS, AGE_GROUP_PATTERN, GENDERS, COMPETITION_LEVELS } = require('./api-enums');
+
+// A COP bracket, or a meet's own custom group key ('Custom…'; owner, 2026-11-15).
+const AGE_GROUP_SCHEMA = { type: 'string', pattern: AGE_GROUP_PATTERN.source, example: AGE_GROUPS[1] };
+
+const { JUDGE_SEAT_TYPES, MAX_SEAT_NO } = require('../config/judge-seats');
+
+const JUDGE_TYPES = [...JUDGE_SEAT_TYPES];
+
+// ---------------------------------------------------------------------------
+// Reusable pieces
+// ---------------------------------------------------------------------------
+
+const ref = (name) => ({ $ref: `#/components/schemas/${name}` });
+
+/** A 2xx body in this API is always `{ success: true, data: <payload> }`. */
+const ok = (description, dataSchema) => ({
+  description,
+  content: {
+    'application/json': {
+      schema: {
+        type: 'object',
+        properties: {
+          success: { type: 'boolean', example: true },
+          data: dataSchema || {},
+          message: { type: 'string' },
+        },
+      },
+    },
+  },
+});
+
+const errorResponse = (description) => ({
+  description,
+  content: { 'application/json': { schema: ref('Error') } },
+});
+
+/** The error responses every authenticated route can produce. */
+const AUTH_ERRORS = {
+  401: errorResponse('Missing, invalid, expired or logged-out token'),
+  403: errorResponse('Authenticated, but the principal lacks the required role'),
+};
+
+const VALIDATION_ERROR = {
+  400: errorResponse('Request failed validation — `error.details` names the field'),
+};
+
+const NOT_FOUND = { 404: errorResponse('Resource not found') };
+
+const queryParam = (name, schema, description, required = false) => ({
+  name, in: 'query', required, schema, description,
+});
+
+const pathParam = (name, description) => ({
+  name, in: 'path', required: true, schema: { type: 'string' }, description,
+});
+
+/** gender + ageGroup + competitionType + apparatus, as query filters. */
+const CATEGORY_QUERY = [
+  queryParam('gender', { type: 'string', enum: GENDERS }, 'Category gender'),
+  queryParam('ageGroup', AGE_GROUP_SCHEMA, 'Category age group'),
+  queryParam('competitionType', { type: 'string', enum: COMPETITION_TYPES }, 'Competition I / II / III (slug or display form)'),
+  queryParam('apparatus', { type: 'string', enum: APPARATUS }, 'Apparatus filter'),
+];
+
+const PAGINATION_QUERY = [
+  queryParam('page', { type: 'integer', minimum: 1, default: 1 }, 'Page number (1-based)'),
+  queryParam('limit', { type: 'integer', minimum: 1, maximum: 100, default: 10 }, 'Rows per page'),
+];
+
+/**
+ * Build one operation.
+ *
+ * `competitionContext` marks the routes behind `validateCompetitionContext`,
+ * which resolves the competition from the token, then `X-Competition-Id`, then
+ * the body, then the query — and 400s when none of them carry it. That header
+ * is the single most common cause of a 400 on this API, so it is declared
+ * explicitly on every route that needs it rather than described once in prose.
+ */
+const op = ({
+  tag, summary, description, operationId,
+  auth = true, roles, competitionContext = false,
+  parameters = [], requestBody, responses = {}, deprecated,
+}) => {
+  const params = [...parameters];
+  if (competitionContext) {
+    params.unshift({
+      name: 'X-Competition-Id',
+      in: 'header',
+      required: false,
+      schema: { type: 'string', format: 'objectid' },
+      description:
+        'Competition context. Required unless the access token already carries one '
+        + '(set via POST /api/auth/set-competition) or the body/query supplies `competitionId`.',
+    });
+  }
+
+  const operation = {
+    tags: [tag],
+    summary,
+    operationId,
+    parameters: params.length ? params : undefined,
+    requestBody,
+    responses: {
+      ...responses,
+      ...(auth ? AUTH_ERRORS : {}),
+      500: errorResponse('Unhandled server error'),
+    },
+  };
+
+  const notes = [description];
+  if (roles) notes.push(`**Roles:** ${roles}`);
+  if (!auth) notes.push('**Public** — no authentication required.');
+  if (competitionContext) {
+    notes.push('**Competition context required** — see the `X-Competition-Id` parameter.');
+  }
+  operation.description = notes.filter(Boolean).join('\n\n');
+
+  if (deprecated) operation.deprecated = true;
+  if (auth) operation.security = [{ bearerAuth: [] }, { cookieAuth: [] }];
+  else operation.security = [];
+
+  return operation;
+};
+
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+const schemas = {
+  Error: {
+    type: 'object',
+    properties: {
+      success: { type: 'boolean', example: false },
+      error: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', example: 'Competition context is required.' },
+          code: {
+            type: 'string',
+            example: 'VALIDATION_ERROR',
+            description: 'Stable machine-readable code — see src/errors/error-codes.js',
+          },
+          details: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description: 'Field name → message, for validation failures',
+          },
+        },
+      },
+    },
+  },
+
+  LoginResponse: {
+    type: 'object',
+    description:
+      'The access token is ALSO set as an httpOnly `access_token` cookie and a '
+      + '`refresh_token` cookie. Browser clients should rely on the cookies; the '
+      + 'body copy exists for non-browser clients.',
+    properties: {
+      token: { type: 'string' },
+      user: ref('UserSummary'),
+      userType: { type: 'string', enum: ['player', 'coach', 'admin', 'superadmin', 'judge'] },
+    },
+  },
+
+  UserSummary: {
+    type: 'object',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      firstName: { type: 'string' },
+      lastName: { type: 'string' },
+      email: { type: 'string', format: 'email' },
+      phone: { type: 'string' },
+      isActive: { type: 'boolean' },
+    },
+  },
+
+  Competition: {
+    type: 'object',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      name: { type: 'string', example: 'National Mallakhamb Championship' },
+      year: { type: 'integer', example: 2026 },
+      place: { type: 'string', example: 'Mumbai' },
+      level: { type: 'string', enum: [...COMPETITION_LEVELS], description: 'Stored lowercase. zonal sits between district and state; dso = District Sports Office; university = inter-university.' },
+      status: { type: 'string', enum: ['upcoming', 'open', 'ongoing', 'completed', 'cancelled'] },
+      startDate: { type: 'string', format: 'date-time' },
+      endDate: { type: 'string', format: 'date-time' },
+      playerFee: { type: 'number', description: 'Base entry fee per athlete, INR', example: 500 },
+      maxTeamSize: { type: 'integer', enum: [4, 6], nullable: true, description: 'Max athletes per team per gender + age group; 4 → best 3 count toward Team Championship, 6 → best 5. Null on meets saved before it existed (read as 6, uncapped).' },
+      apparatusFees: {
+        type: 'object',
+        additionalProperties: { type: 'number' },
+        description: 'Per-apparatus add-on, INR, charged on top of `playerFee`',
+      },
+      registrationOpenDate: {
+        type: 'string', format: 'date-time', nullable: true,
+        description: 'First day entry fees can be paid. Super admin only. Unset means always open.',
+      },
+      feeDueDate: {
+        type: 'string', format: 'date-time', nullable: true,
+        description:
+          'Last day the base fee alone is accepted. Payments made after 23:59 UTC on this '
+          + 'day, up to 23:59 UTC on `endDate`, are charged `lateFee` PER ATHLETE. '
+          + 'Super admin only; unset means no late fee is ever charged.',
+      },
+      lateFee: {
+        type: 'number',
+        description: 'Per-athlete penalty for paying after `feeDueDate`, INR. Super admin only.',
+        example: 200,
+      },
+      competitionTypes: { type: 'array', items: { type: 'string', enum: COMPETITION_TYPES } },
+      ageGroups: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            gender: { type: 'string', enum: GENDERS },
+            ageGroup: AGE_GROUP_SCHEMA,
+            status: { type: 'string' },
+          },
+        },
+      },
+      customAgeGroups: { type: 'array', description: 'Age groups this meet adds to the COP ones (Super Admin only)', items: { type: 'object', properties: { key: { type: 'string', pattern: '^Custom[A-Za-z0-9]{1,40}$' }, label: { type: 'string', maxLength: 40 }, minAge: { type: 'integer', nullable: true }, maxAge: { type: 'integer', nullable: true } } } },
+      registeredTeams: {
+        type: 'array',
+        description:
+          'Embedded entries. This array carries the whole squad of every entered '
+          + 'team, which is why endpoints that populate it are the expensive ones.',
+        items: ref('RegisteredTeam'),
+      },
+    },
+  },
+
+  RegisteredTeam: {
+    type: 'object',
+    properties: {
+      team: { type: 'string', format: 'objectid' },
+      coach: { type: 'string', format: 'objectid' },
+      isSubmitted: { type: 'boolean' },
+      submittedAt: { type: 'string', format: 'date-time' },
+      paymentStatus: { type: 'string', enum: ['pending', 'paid', 'failed', 'refunded'] },
+      players: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            player: { type: 'string', format: 'objectid' },
+            ageGroup: AGE_GROUP_SCHEMA,
+            gender: { type: 'string', enum: GENDERS },
+            apparatus: {
+              type: 'object',
+              description: 'competitionType slug → apparatus[] the athlete is entered on',
+              additionalProperties: { type: 'array', items: { type: 'string', enum: APPARATUS } },
+            },
+          },
+        },
+      },
+    },
+  },
+
+  Team: {
+    type: 'object',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      name: { type: 'string', example: 'SGAM-A' },
+      description: { type: 'string' },
+      coach: ref('UserSummary'),
+      isActive: { type: 'boolean' },
+      createdAt: { type: 'string', format: 'date-time' },
+    },
+  },
+
+  SubmittedTeam: {
+    type: 'object',
+    description: 'A team the coach has final-submitted AND paid for.',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      name: { type: 'string' },
+      coach: ref('UserSummary'),
+      isSubmitted: { type: 'boolean' },
+      paymentStatus: { type: 'string' },
+      players: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            player: ref('UserSummary'),
+            ageGroup: AGE_GROUP_SCHEMA,
+            gender: { type: 'string', enum: GENDERS },
+            apparatus: { type: 'object', additionalProperties: true },
+            isFinalized: { type: 'boolean', description: 'Senior Judge has Final Submitted this athlete' },
+            finalScore: { type: 'number', nullable: true },
+            hasScore: { type: 'boolean' },
+          },
+        },
+      },
+    },
+  },
+
+  Player: {
+    type: 'object',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      firstName: { type: 'string' },
+      lastName: { type: 'string' },
+      loginId: { type: 'string', description: 'The Player ID: firstname.lastname.ddmmyy, .2/.3 for a duplicate. Set by the server, never changed.' },
+      emailType: { type: 'string', enum: ['self', 'guardian', 'none'], description: "Whose address `email` is. Only 'self' signs in or is unique." },
+      email: { type: 'string', format: 'email', nullable: true },
+      guardian: ref('PlayerGuardian'),
+      consentAt: { type: 'string', format: 'date-time', nullable: true },
+      phone: { type: 'string' },
+      dateOfBirth: { type: 'string', format: 'date' },
+      gender: { type: 'string', enum: GENDERS },
+      ageGroup: { ...AGE_GROUP_SCHEMA, nullable: true },
+      team: { type: 'string', format: 'objectid', nullable: true },
+      stateUnit: { type: 'string', nullable: true },
+      registrationNumber: { type: 'string', nullable: true },
+    },
+  },
+
+  PlayerGuardian: {
+    type: 'object',
+    description: 'The responsible adult for a player using a guardian email or none.',
+    properties: {
+      name: { type: 'string', nullable: true },
+      relation: { type: 'string', nullable: true },
+      phone: { type: 'string', nullable: true },
+    },
+  },
+
+  Judge: {
+    type: 'object',
+    description:
+      'A panel SEAT, not a login. The person filling it is `judgeAccount`; the '
+      + 'same account routinely holds different seats in different categories.',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      competition: { type: 'string', format: 'objectid' },
+      gender: { type: 'string', enum: GENDERS },
+      ageGroup: AGE_GROUP_SCHEMA,
+      judgeNo: { type: 'integer', minimum: 1, maximum: MAX_SEAT_NO },
+      judgeType: { type: 'string', enum: JUDGE_TYPES },
+      competitionTypes: { type: 'array', items: { type: 'string', enum: COMPETITION_TYPES } },
+      apparatus: {
+        type: 'string',
+        enum: APPARATUS,
+        nullable: true,
+        description:
+          'Part of the panel\'s IDENTITY: a meet holds one panel per '
+          + '(gender, ageGroup, apparatus). `null` is the legacy shape and still '
+          + 'covers every apparatus in its category; nothing writes it any more.',
+      },
+      judgeAccount: { type: 'string', format: 'objectid', nullable: true, description: 'null = empty slot' },
+      isActive: { type: 'boolean' },
+    },
+  },
+
+  JudgeSlipBreakdown: {
+    type: 'object',
+    description:
+      'COP §3.3 section marks. Each section is capped and the total may not exceed 10.00.\n\n'
+      + '`difficulty` and `combination` are OBJECTS carrying a `total` plus the '
+      + 'selections behind it — the element list and the checklist — so re-opening '
+      + 'a slip restores the exact selections rather than only the section total. '
+      + '`execution` and `bonus` are plain numbers.\n\n'
+      + 'Sending a bare number for `difficulty` or `combination` is not rejected: '
+      + 'the server reads `.total` off it, gets `undefined`, and treats the section '
+      + 'as 0. Send the object form.',
+    properties: {
+      difficulty: {
+        type: 'object',
+        properties: {
+          total: { type: 'number', minimum: 0, maximum: 3.8 },
+          elements: {
+            type: 'array',
+            description: 'The A/B/C elements performed, valued 0.20 / 0.40 / 0.60.',
+            items: { type: 'object', additionalProperties: true },
+          },
+        },
+      },
+      combination: {
+        type: 'object',
+        properties: {
+          total: { type: 'number', minimum: 0, maximum: 1.6 },
+          checklist: {
+            type: 'object',
+            description: 'The per-apparatus checklist; a failed item deducts its penalty.',
+            additionalProperties: true,
+          },
+        },
+      },
+      execution: { type: 'number', minimum: 0, maximum: 4.4 },
+      bonus: { type: 'number', enum: [0, 0.2], description: 'All-or-nothing. Also accepted as `originality`.' },
+    },
+  },
+
+  PlayerScore: {
+    type: 'object',
+    properties: {
+      playerId: { type: 'string', format: 'objectid' },
+      playerName: { type: 'string' },
+      playerGender: { type: 'string', enum: GENDERS },
+      playerAgeGroup: AGE_GROUP_SCHEMA,
+      apparatus: { type: 'string', enum: APPARATUS },
+      judgeScores: {
+        type: 'object',
+        description: 'seat → mark, e.g. { seniorJudge: 8.6, judge1: 8.4, judge2: 8.5 }',
+        additionalProperties: { type: 'number' },
+      },
+      judgeSlips: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      averageMarks: { type: 'number' },
+      executionAverage: { type: 'number' },
+      baseScore: { type: 'number' },
+      toleranceUsed: { type: 'number' },
+      deduction: { type: 'number', description: 'Time deduction recorded by the Scorer' },
+      otherDeduction: { type: 'number' },
+      finalScore: { type: 'number' },
+      isFinalized: { type: 'boolean' },
+      finalizedAt: { type: 'string', format: 'date-time' },
+    },
+  },
+
+  Score: {
+    type: 'object',
+    description:
+      'One document per (team, gender, ageGroup, competition, competitionType) — '
+      + 'the unique index `score_identity_unique`.',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      competition: { type: 'string', format: 'objectid' },
+      teamId: { type: 'string', format: 'objectid' },
+      gender: { type: 'string', enum: GENDERS },
+      ageGroup: AGE_GROUP_SCHEMA,
+      competitionType: { type: 'string', enum: ['Competition I', 'Competition II', 'Competition III'] },
+      playerScores: { type: 'array', items: ref('PlayerScore') },
+      timeKeeper: { type: 'string' },
+      scorer: { type: 'string' },
+      remarks: { type: 'string' },
+      isLocked: { type: 'boolean' },
+    },
+  },
+
+  SaveScoreRequest: {
+    type: 'object',
+    description:
+      'Two shapes share this endpoint.\n\n'
+      + '**Single judge slip** — `playerId` + `score` (+ optional `breakdown`). The '
+      + 'panel seat written is resolved from the caller\'s own assignment for THIS '
+      + 'category; a `judgeType` in the body is ignored unless the caller is a '
+      + 'Senior Judge overriding, or an admin recording on the panel\'s behalf.\n\n'
+      + '**Bulk sheet** — `playerScores[]`, used by the Scorer and admin screens.',
+    properties: {
+      competition: { type: 'string', format: 'objectid' },
+      teamId: { type: 'string', format: 'objectid' },
+      gender: { type: 'string', enum: GENDERS },
+      ageGroup: AGE_GROUP_SCHEMA,
+      competitionType: { type: 'string', enum: COMPETITION_TYPES },
+      apparatus: { type: 'string', enum: APPARATUS },
+      playerId: { type: 'string', format: 'objectid', description: 'Single-slip form' },
+      playerName: { type: 'string' },
+      score: { type: 'number', minimum: 0, maximum: 10, description: 'Single-slip form' },
+      breakdown: ref('JudgeSlipBreakdown'),
+      judgeType: {
+        type: 'string',
+        enum: JUDGE_TYPES,
+        description: 'Honoured only for admins, or a Senior Judge with `overrideBySenior`',
+      },
+      overrideBySenior: { type: 'boolean' },
+      isFinalSubmit: {
+        type: 'boolean',
+        description: 'Senior Judge only — finalizes and locks this athlete\'s result',
+      },
+      panelSize: { type: 'integer', enum: [3, 4, 5] },
+      playerScores: { type: 'array', items: ref('PlayerScore'), description: 'Bulk form' },
+      timeKeeper: { type: 'string' },
+      scorer: { type: 'string' },
+      remarks: { type: 'string' },
+      isLocked: { type: 'boolean' },
+    },
+  },
+
+  RunningOrder: {
+    type: 'object',
+    properties: {
+      competition: { type: 'string', format: 'objectid' },
+      gender: { type: 'string', enum: GENDERS },
+      ageGroup: AGE_GROUP_SCHEMA,
+      competitionType: { type: 'string' },
+      lotsDrawnAt: { type: 'string', format: 'date-time', nullable: true },
+      hasOrder: { type: 'boolean' },
+      teams: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            _id: { type: 'string', format: 'objectid' },
+            name: { type: 'string' },
+            coachName: { type: 'string' },
+            lotNo: { type: 'integer', nullable: true },
+            position: { type: 'integer', nullable: true },
+            playerCount: { type: 'integer' },
+            players: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          },
+        },
+      },
+    },
+  },
+
+  Transaction: {
+    type: 'object',
+    properties: {
+      _id: { type: 'string', format: 'objectid' },
+      competition: { type: 'string', format: 'objectid' },
+      team: { type: 'string', format: 'objectid' },
+      coach: { type: 'string', format: 'objectid' },
+      amount: { type: 'number' },
+      paymentStatus: { type: 'string', enum: ['pending', 'paid', 'failed', 'refunded'] },
+      razorpayOrderId: { type: 'string' },
+      razorpayPaymentId: { type: 'string' },
+      createdAt: { type: 'string', format: 'date-time' },
+    },
+  },
+
+  Paginated: {
+    type: 'object',
+    properties: {
+      total: { type: 'integer' },
+      page: { type: 'integer' },
+      pages: { type: 'integer' },
+    },
+  },
+
+  DashboardStats: {
+    type: 'object',
+    properties: {
+      totalTeams: { type: 'integer' },
+      totalParticipants: { type: 'integer' },
+      boysTeams: { type: 'integer' },
+      girlsTeams: { type: 'integer' },
+      totalBoys: { type: 'integer' },
+      totalGirls: { type: 'integer' },
+      submittedTeams: { type: 'integer' },
+      totalJudges: { type: 'integer' },
+      competition: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          startDate: { type: 'string', format: 'date-time' },
+          endDate: { type: 'string', format: 'date-time' },
+          status: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Request body helpers
+// ---------------------------------------------------------------------------
+
+const jsonBody = (schema, required = true) => ({
+  required,
+  content: { 'application/json': { schema } },
+});
+
+const inline = (properties, requiredFields = []) => ({
+  type: 'object',
+  properties,
+  required: requiredFields.length ? requiredFields : undefined,
+});
+
+const S = {
+  id: { type: 'string', format: 'objectid' },
+  str: { type: 'string' },
+  email: { type: 'string', format: 'email' },
+  bool: { type: 'boolean' },
+  num: { type: 'number' },
+  int: { type: 'integer' },
+  gender: { type: 'string', enum: GENDERS },
+  ageGroup: AGE_GROUP_SCHEMA,
+  competitionType: { type: 'string', enum: COMPETITION_TYPES },
+  apparatus: { type: 'string', enum: APPARATUS },
+  judgeType: { type: 'string', enum: JUDGE_TYPES },
+};
+
+const loginBody = jsonBody(inline({ email: S.email, password: S.str }, ['email', 'password']));
+
+// An email, or a player's Player ID. `email` is still read when `identifier` is absent.
+const IDENTIFIER = { type: 'string', description: 'Email address, or (players only) Player ID' };
+
+/** The category quadruple, as a request body fragment. */
+const categoryBody = {
+  gender: S.gender,
+  ageGroup: S.ageGroup,
+  competitionType: S.competitionType,
+};
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/* eslint-disable max-lines-per-function */
+function buildPaths() {
+  const paths = {};
+
+  const add = (path, method, operation) => {
+    paths[path] = paths[path] || {};
+    paths[path][method] = operation;
+  };
+
+  // ===================== Health & meta =====================
+
+  add('/api/health', 'get', op({
+    tag: 'Health', auth: false, operationId: 'health',
+    summary: 'Detailed health check',
+    description: 'Component-by-component status. Touches the database, so it is not the probe to poll at high frequency — use `/api/health/live`.',
+    responses: { 200: ok('Health report') },
+  }));
+
+  add('/api/health/live', 'get', op({
+    tag: 'Health', auth: false, operationId: 'healthLive',
+    summary: 'Liveness probe',
+    description: 'Process is up. No I/O — safe to poll aggressively.',
+    responses: { 200: ok('Alive') },
+  }));
+
+  add('/api/health/ping', 'get', op({
+    tag: 'Health', auth: false, operationId: 'healthPing',
+    summary: 'Uptime ping',
+    description: 'For uptime pingers (UptimeRobot, cron-job.org) and the built-in keep-alive that stops '
+      + 'Render\'s free plan sleeping. Same body as `/api/health/live`; no I/O, `Cache-Control: no-store`. '
+      + 'HEAD works too.',
+    responses: { 200: ok('Alive') },
+  }));
+
+  add('/api/health/ready', 'get', op({
+    tag: 'Health', auth: false, operationId: 'healthReady',
+    summary: 'Readiness probe',
+    description: 'Ready to take traffic: checks the database connection.',
+    responses: { 200: ok('Ready'), 503: errorResponse('Not ready') },
+  }));
+
+  add('/api/health-legacy', 'get', op({
+    tag: 'Health', auth: false, operationId: 'healthLegacy',
+    summary: 'Legacy liveness string',
+    description: 'Kept for an old caller. Prefer `/api/health/live`.',
+    deprecated: true,
+    responses: { 200: ok('Alive') },
+  }));
+
+  add('/api/csrf-token', 'get', op({
+    tag: 'Auth', auth: false, operationId: 'csrfToken',
+    summary: 'Issue a CSRF token',
+    description:
+      'Sets the `csrf-token` cookie AND returns the token in the body. The SPA reads '
+      + 'the BODY copy, because the client origin and the API are different sites and '
+      + 'JS cannot read another origin\'s cookie. Send it back in `X-CSRF-Token` on '
+      + 'every POST/PUT/PATCH/DELETE. Requests carrying `Authorization: Bearer` are exempt.',
+    responses: { 200: ok('Token issued', inline({ csrfToken: S.str })) },
+  }));
+
+  // ===================== Auth =====================
+
+  add('/api/auth/me', 'get', op({
+    tag: 'Auth', operationId: 'authMe',
+    summary: 'The authenticated principal',
+    description: 'Session rehydration on page load. Works with either the cookie or a Bearer token.',
+    responses: { 200: ok('Current principal', ref('UserSummary')) },
+  }));
+
+  // ── The signed-in user's own account (every role; the top-right account menu) ──
+  const PENDING_EMAIL_CHANGE = {
+    type: 'object', nullable: true,
+    properties: {
+      newEmail: S.email,
+      newEmailType: { type: 'string', enum: ['self', 'guardian'], nullable: true },
+      status: { type: 'string', enum: ['awaiting-code', 'awaiting-coach'] },
+      expiresAt: { type: 'string', format: 'date-time' },
+    },
+  };
+  const ACCOUNT = inline({ user: { type: 'object' }, userType: S.str, pendingEmailChange: PENDING_EMAIL_CHANGE }, []);
+
+  add('/api/auth/me/account', 'get', op({
+    tag: 'Auth', operationId: 'getOwnAccount',
+    summary: 'Own account, for the profile page',
+    description: 'The profile without credentials, plus any email change in progress.',
+    responses: { 200: ok('Account', ACCOUNT) },
+  }));
+
+  add('/api/auth/me', 'put', op({
+    tag: 'Auth', operationId: 'updateOwnAccount',
+    summary: 'Edit own profile',
+    description: 'Only the fields the role may change are applied (player: names, phone, guardian, state/unit, MFI no.; '
+      + 'date of birth and gender only before joining a team; coach: names, phone; admin: name; judge: names, phone, '
+      + 'state/unit, MFI no., certification). Anything else in the body is ignored. Email and password have their own endpoints.',
+    requestBody: jsonBody(inline({
+      firstName: S.str, lastName: S.str, name: S.str, phone: S.str, guardian: ref('PlayerGuardian'),
+      dateOfBirth: { type: 'string', format: 'date' }, gender: S.gender,
+      stateUnit: S.str, registrationNumber: S.str, certificationLevel: S.str,
+    }, [])),
+    responses: { 200: ok('Updated account', ACCOUNT), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/me/password', 'put', op({
+    tag: 'Auth', operationId: 'changeOwnPassword',
+    summary: 'Change own password',
+    description: 'Needs the current password. Signs out every other session and sets fresh cookies for this one.',
+    requestBody: jsonBody(inline({ currentPassword: S.str, newPassword: { type: 'string', minLength: 8 } }, ['currentPassword', 'newPassword'])),
+    responses: { 200: ok('Password changed', ref('LoginResponse')), 401: errorResponse('Current password is incorrect'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/me/email', 'post', op({
+    tag: 'Auth', operationId: 'requestOwnEmailChange',
+    summary: 'Start an email change',
+    description: 'Needs the current password. Mails a 6-digit code to the NEW address; nothing changes until it is confirmed. '
+      + "A player chooses whether the address is their own (`self`, unique) or a guardian's (may be shared). Replaces any change in progress.",
+    requestBody: jsonBody(inline({ newEmail: S.email, emailType: { type: 'string', enum: ['self', 'guardian'] }, currentPassword: S.str }, ['newEmail', 'currentPassword'])),
+    responses: { 200: ok('Code sent', PENDING_EMAIL_CHANGE), 401: errorResponse('Current password is incorrect'), 409: errorResponse('Address already registered'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/me/email', 'delete', op({
+    tag: 'Auth', operationId: 'cancelOwnEmailChange',
+    summary: 'Cancel an email change in progress',
+    responses: { 200: ok('Cancelled') },
+  }));
+
+  add('/api/auth/me/email/confirm', 'post', op({
+    tag: 'Auth', operationId: 'confirmOwnEmailChange',
+    summary: 'Finish an email change with the mailed code',
+    description: "Switches the address and tells the old one. A player who had no email goes to `awaiting-coach` instead: their coach approves the address. Five wrong codes drop the request.",
+    requestBody: jsonBody(inline({ code: S.str }, ['code'])),
+    responses: { 200: ok('Changed, or waiting for the coach', inline({ status: { type: 'string', enum: ['done', 'awaiting-coach'] }, user: { type: 'object' } }, [])), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/logout', 'post', op({
+    tag: 'Auth', operationId: 'authLogout',
+    summary: 'Log out',
+    description: 'Clears both cookies and records the logout instant, which invalidates every access token issued before it.',
+    responses: { 200: ok('Logged out') },
+  }));
+
+  add('/api/auth/refresh', 'post', op({
+    tag: 'Auth', auth: false, operationId: 'authRefresh',
+    summary: 'Exchange the refresh cookie for a new access token',
+    description: 'Uses the httpOnly `refresh_token` cookie; nothing is read from the body.',
+    responses: { 200: ok('New access token issued', ref('LoginResponse')), 401: errorResponse('Refresh token missing, expired or revoked') },
+  }));
+
+  // One email can own several role accounts; userType picks which one.
+  const RESET_USER_TYPE = { type: 'string', enum: ['player', 'coach', 'admin', 'judge'] };
+
+  add('/api/auth/forgot-password', 'post', op({
+    tag: 'Auth', auth: false, operationId: 'forgotPassword',
+    summary: 'Send a password-reset OTP',
+    description: 'Always answers 200 whether or not the account exists, so the endpoint cannot be used to enumerate accounts. '
+      + "A Player ID sends the code to the player's address (their own or a guardian's); a player with no email gets none. "
+      + "A guardian's address is mailed the Player IDs registered under it instead of a code.",
+    requestBody: jsonBody(inline({ identifier: IDENTIFIER, email: S.email, userType: RESET_USER_TYPE }, [])),
+    responses: { 200: ok('OTP sent if the account exists'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/verify-otp', 'post', op({
+    tag: 'Auth', auth: false, operationId: 'verifyOtp',
+    summary: 'Verify a reset OTP',
+    requestBody: jsonBody(inline({ identifier: IDENTIFIER, email: S.email, otp: S.str, userType: RESET_USER_TYPE }, ['otp'])),
+    description: 'Every failure — unknown email, no code, expired, wrong, or discarded after OTP_MAX_ATTEMPTS wrong guesses — returns the same message.',
+    responses: { 200: ok('OTP accepted'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/reset-password-coach', 'post', op({
+    tag: 'Auth', auth: false, operationId: 'resetPasswordCoach',
+    summary: 'Reset a password with the code from your coach',
+    description: 'For a player registered without an email: "Forgot password" with their Player ID opens a request, their coach approves it and is shown a 6-digit code (24 h) to hand over. Every failure answers the same; five wrong codes void the approval.',
+    requestBody: jsonBody(inline({ identifier: IDENTIFIER, code: S.str, password: { type: 'string', minLength: 8 } }, ['identifier', 'code', 'password'])),
+    responses: { 200: ok('Password changed'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/reset-password-otp', 'post', op({
+    tag: 'Auth', auth: false, operationId: 'resetPasswordOtp',
+    summary: 'Reset a password with an OTP',
+    requestBody: jsonBody(inline({ identifier: IDENTIFIER, email: S.email, otp: S.str, password: S.str, userType: RESET_USER_TYPE }, ['otp', 'password'])),
+    responses: { 200: ok('Password changed'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/set-competition', 'post', op({
+    tag: 'Auth', operationId: 'setCompetition',
+    summary: 'Bind the session to a competition',
+    description:
+      'Re-issues the access token with `competitionId` baked in, which is what lets '
+      + 'the competition-scoped routes work without an `X-Competition-Id` header.',
+    requestBody: jsonBody(inline({ competitionId: S.id }, ['competitionId'])),
+    responses: { 200: ok('Context set', ref('LoginResponse')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/auth/competitions/assigned', 'get', op({
+    tag: 'Auth', operationId: 'assignedCompetitions',
+    summary: 'Competitions this principal may act in',
+    responses: { 200: ok('Assigned competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  // ===================== Players =====================
+
+  add('/api/players/register', 'post', op({
+    tag: 'Players', auth: false, operationId: 'registerPlayer',
+    summary: 'Register an athlete',
+    description: 'Rate limited per IP. `emailType` is the first-screen choice: own email (default; email and phone required), '
+      + "a guardian's email (email and guardian required; siblings may share it), or none (guardian required). "
+      + 'A player under 18 needs `guardianConsent: true`. The response carries the assigned Player ID as `user.loginId`.',
+    requestBody: jsonBody(inline({
+      firstName: S.str, lastName: S.str,
+      emailType: { type: 'string', enum: ['self', 'guardian', 'none'] },
+      email: S.email, phone: S.str,
+      guardian: ref('PlayerGuardian'),
+      guardianConsent: S.bool,
+      password: { type: 'string', minLength: 8 },
+      dateOfBirth: { type: 'string', format: 'date' },
+      gender: S.gender, stateUnit: S.str, registrationNumber: S.str,
+    }, ['firstName', 'lastName', 'password', 'dateOfBirth', 'gender'])),
+    responses: { 201: ok('Registered', ref('LoginResponse')), ...VALIDATION_ERROR, 409: errorResponse('E-mail already registered') },
+  }));
+
+  add('/api/players/login', 'post', op({
+    tag: 'Players', auth: false, operationId: 'loginPlayer',
+    summary: 'Athlete login',
+    description: "Rate limited per IP. Locks the account temporarily after repeated failures. `identifier` is the player's own email or their Player ID; a guardian's address never signs in.",
+    requestBody: jsonBody(inline({ identifier: IDENTIFIER, email: S.email, password: S.str }, ['password'])),
+    responses: { 200: ok('Logged in', ref('LoginResponse')), 401: errorResponse('Bad credentials'), 423: errorResponse('Account locked') },
+  }));
+
+  add('/api/players/profile', 'get', op({
+    tag: 'Players', roles: 'player', operationId: 'playerProfile',
+    summary: 'Own profile',
+    responses: { 200: ok('Profile', ref('Player')) },
+  }));
+
+  add('/api/players/teams', 'get', op({
+    tag: 'Players', roles: 'player', operationId: 'playerAvailableTeams',
+    summary: 'Teams an athlete may join',
+    description: 'Teams belonging to competitions that are open for registration.',
+    responses: { 200: ok('Teams', { type: 'array', items: ref('Team') }) },
+  }));
+
+  add('/api/players/competitions/open', 'get', op({
+    tag: 'Players', roles: 'player', operationId: 'playerOpenCompetitions',
+    summary: 'Competitions open for registration',
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/players/team', 'get', op({
+    tag: 'Players', roles: 'player', competitionContext: true, operationId: 'playerTeam',
+    summary: 'The athlete\'s team in the current competition',
+    responses: { 200: ok('Team', ref('Team')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/players/team/join', 'post', op({
+    tag: 'Players', roles: 'player', operationId: 'playerJoinTeam',
+    summary: 'Join a team',
+    requestBody: jsonBody(inline({ teamId: S.id, competitionId: S.id }, ['teamId'])),
+    responses: { 200: ok('Joined'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  // ===================== Coaches =====================
+
+  add('/api/coaches/register', 'post', op({
+    tag: 'Coaches', auth: false, operationId: 'registerCoach',
+    summary: 'Register a coach',
+    requestBody: jsonBody(inline({
+      firstName: S.str, lastName: S.str, email: S.email, phone: S.str,
+      password: { type: 'string', minLength: 8 },
+    }, ['firstName', 'lastName', 'email', 'phone', 'password'])),
+    responses: { 201: ok('Registered', ref('LoginResponse')), ...VALIDATION_ERROR, 409: errorResponse('E-mail already registered') },
+  }));
+
+  add('/api/coaches/login', 'post', op({
+    tag: 'Coaches', auth: false, operationId: 'loginCoach',
+    summary: 'Coach login',
+    requestBody: loginBody,
+    responses: { 200: ok('Logged in', ref('LoginResponse')), 401: errorResponse('Bad credentials') },
+  }));
+
+  // ── Approving resets and email additions for players with no email (plan Part C) ──
+  const ACCOUNT_REQUEST = {
+    type: 'object',
+    properties: {
+      id: S.id,
+      kind: { type: 'string', enum: ['password-reset', 'email-change'] },
+      status: { type: 'string', enum: ['awaiting-coach', 'approved'] },
+      createdAt: { type: 'string', format: 'date-time' },
+      expiresAt: { type: 'string', format: 'date-time' },
+      newEmail: S.email,
+      newEmailType: { type: 'string', enum: ['self', 'guardian'] },
+      codeExpiresAt: { type: 'string', format: 'date-time' },
+      player: inline({ id: S.id, firstName: S.str, lastName: S.str, loginId: S.str, team: S.str }, []),
+    },
+  };
+  const DECISION = inline({
+    status: { type: 'string', enum: ['approved', 'done', 'rejected'] },
+    code: { type: 'string', description: 'Password reset only: the one-time code for the player. Shown once.' },
+    codeExpiresAt: { type: 'string', format: 'date-time' },
+  }, []);
+  const accountRequestRoutes = (prefix, roles, tag, idBase, who) => {
+    add(`${prefix}/account-requests`, 'get', op({
+      tag, roles, operationId: `${idBase}AccountRequests`,
+      summary: 'Resets and email additions waiting for approval',
+      description: who,
+      responses: { 200: ok('Open requests', { type: 'array', items: ACCOUNT_REQUEST }) },
+    }));
+    add(`${prefix}/account-requests/{requestId}/approve`, 'post', op({
+      tag, roles, operationId: `${idBase}ApproveAccountRequest`,
+      summary: 'Approve a request',
+      description: 'A password reset returns a one-time 6-digit code (24 h) to hand to the player; approving again replaces it. An email addition is applied now. Written to the audit log.',
+      parameters: [pathParam('requestId', 'Account request')],
+      responses: { 200: ok('Approved', DECISION), 403: errorResponse('Not this approver’s player'), 404: errorResponse('No such open request') },
+    }));
+    add(`${prefix}/account-requests/{requestId}/reject`, 'post', op({
+      tag, roles, operationId: `${idBase}RejectAccountRequest`,
+      summary: 'Turn a request down',
+      parameters: [pathParam('requestId', 'Account request')],
+      responses: { 200: ok('Rejected', DECISION), 403: errorResponse('Not this approver’s player'), 404: errorResponse('No such open request') },
+    }));
+  };
+  accountRequestRoutes('/api/coaches', 'coach', 'Coaches', 'coach', 'Requests from players on any of this coach’s teams.');
+  accountRequestRoutes('/api/superadmin', 'superadmin', 'Super admin', 'superAdmin', 'Every open request except those from players a coach registered (those go to that coach only; deciding one here is a 403).');
+
+  add('/api/coaches/profile', 'get', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachProfile',
+    summary: 'Own profile',
+    responses: { 200: ok('Profile', ref('UserSummary')) },
+  }));
+
+  add('/api/coaches/status', 'get', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachStatus',
+    summary: 'Onboarding status',
+    description: 'Whether the coach has a team yet — the client uses this to decide whether to park them on the create-team screen.',
+    responses: { 200: ok('Status') },
+  }));
+
+  add('/api/coaches/team', 'post', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachCreateTeam',
+    summary: 'Create a team',
+    description: 'Team names are unique per coach, not globally.',
+    requestBody: jsonBody(inline({ name: S.str, description: S.str }, ['name'])),
+    responses: { 201: ok('Created', ref('Team')), ...VALIDATION_ERROR, 409: errorResponse('This coach already owns a team with that name') },
+  }));
+
+  add('/api/coaches/teams', 'get', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachTeams',
+    summary: 'Own teams',
+    responses: { 200: ok('Teams', { type: 'array', items: ref('Team') }) },
+  }));
+
+  add('/api/coaches/competitions/open', 'get', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachOpenCompetitions',
+    summary: 'Competitions open for entry',
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/coaches/select-competition', 'post', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachSelectCompetition',
+    summary: 'Choose the competition to work in',
+    requestBody: jsonBody(inline({ competitionId: S.id }, ['competitionId'])),
+    responses: { 200: ok('Selected'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/coaches/team/{teamId}/register-competition', 'post', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachRegisterTeam',
+    summary: 'Enter a team in a competition',
+    parameters: [pathParam('teamId', 'Team to enter')],
+    requestBody: jsonBody(inline({ competitionId: S.id }, ['competitionId'])),
+    responses: { 200: ok('Entered'), ...VALIDATION_ERROR, ...NOT_FOUND, 409: errorResponse('Already entered') },
+  }));
+
+  add('/api/coaches/competition/team-status', 'get', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachTeamStatus',
+    summary: 'Entry status of the coach\'s team',
+    responses: { 200: ok('Status'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/coaches/dashboard', 'get', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachDashboard',
+    summary: 'Squad dashboard',
+    description: 'The coach\'s whole entry: roster by age group and gender, payment state, submission state.',
+    responses: { 200: ok('Dashboard'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/coaches/search-players', 'get', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachSearchPlayers',
+    summary: 'Find registered athletes to add to a squad',
+    parameters: [queryParam('q', S.str, 'Name or e-mail fragment')],
+    responses: { 200: ok('Matches', { type: 'array', items: ref('Player') }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/coaches/add-player', 'post', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachAddPlayer',
+    summary: 'Add an athlete to a squad place',
+    description:
+      'The apparatus list decides which score sheet the judge is shown, so the names '
+      + 'are checked rather than left free-form.\n\n'
+      + '`gender` must match the athlete\'s own — a mismatch is refused with 400. The '
+      + 'squad entry\'s gender is what picks the category, the panel and the score '
+      + 'document, so it is not allowed to disagree with the account it refers to.',
+    requestBody: jsonBody(inline({
+      playerId: S.id, ageGroup: S.ageGroup, gender: S.gender,
+      apparatus: { type: 'array', items: S.apparatus },
+    }, ['playerId', 'ageGroup', 'gender'])),
+    responses: { 200: ok('Added'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  // ── Players with no email, registered by their coach ──
+  const DEFAULT_PASSWORD = inline({
+    isSet: S.bool,
+    readable: { type: 'boolean', description: 'False when a value is saved but can no longer be decrypted (key rotated): set it again.' },
+    password: { type: 'string', nullable: true, description: 'In the clear, for the coach to hand to players. Stored encrypted.' },
+    setAt: { type: 'string', format: 'date-time', nullable: true },
+  }, ['isSet', 'readable']);
+  add('/api/coaches/player-default-password', 'get', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachGetPlayerDefaultPassword',
+    summary: 'The default password for players this coach registers',
+    description: 'Readable by the coach so they can hand it out. Sent with Cache-Control: no-store.',
+    responses: { 200: ok('Default password', DEFAULT_PASSWORD) },
+  }));
+  add('/api/coaches/player-default-password', 'put', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachSetPlayerDefaultPassword',
+    summary: 'Set or change the default player password',
+    description: 'Needs the coach’s own current password. Only players registered after the change start with the new value.',
+    requestBody: jsonBody(inline({ password: { type: 'string', minLength: 8 }, currentPassword: S.str }, ['password', 'currentPassword'])),
+    responses: { 200: ok('Saved', DEFAULT_PASSWORD), 401: errorResponse('Current password is incorrect'), ...VALIDATION_ERROR },
+  }));
+  add('/api/coaches/players', 'post', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachRegisterPlayer',
+    summary: 'Register a player with no email onto this coach’s team',
+    description:
+      'The "No email at all" path, done by the coach: Player ID sign-in only, the coach’s default '
+      + 'player password, and the Player ID mailed to the coach. Under 18 needs `guardianConsent: true` '
+      + '(the coach confirms the parent or guardian agreed). The coach is the player’s contact of record: '
+      + 'guardian = the coach’s name, relation "Coach" and phone (400 if the coach has no phone). '
+      + 'A player with the same name and date of birth is '
+      + 'answered 409 with `error.details.matches`; resend with `confirmDuplicate: true` to create anyway. '
+      + 'Entering the player in a meet is the separate add-player step.',
+    requestBody: jsonBody(inline({
+      firstName: S.str, lastName: S.str,
+      dateOfBirth: { type: 'string', format: 'date' }, gender: S.gender,
+      guardianConsent: S.bool, confirmDuplicate: S.bool,
+    }, ['firstName', 'lastName', 'dateOfBirth', 'gender'])),
+    responses: {
+      201: ok('Registered', inline({
+        player: inline({ _id: S.id, firstName: S.str, lastName: S.str, loginId: S.str, gender: S.gender, team: S.id }, []),
+        team: inline({ _id: S.id, name: S.str }, []),
+      }, [])),
+      409: errorResponse('Possible duplicate — see error.details.matches'),
+      ...VALIDATION_ERROR,
+    },
+  }));
+
+  add('/api/coaches/remove-player/{playerId}', 'delete', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachRemovePlayer',
+    summary: 'Remove an athlete from the squad',
+    parameters: [pathParam('playerId', 'Athlete to remove')],
+    responses: { 200: ok('Removed'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/coaches/payments/create-order', 'post', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachCreateOrder',
+    summary: 'Create the Razorpay order for a squad entry',
+    requestBody: jsonBody(inline({ teamId: S.id }, []), false),
+    responses: { 200: ok('Order created'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/coaches/payments/verify-and-submit', 'post', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachVerifyAndSubmit',
+    summary: 'Verify payment and final-submit the squad',
+    description:
+      'The signature is verified server-side. Submission is what puts the team in '
+      + 'front of a judge — an entered-but-unsubmitted team appears nowhere in scoring.',
+    requestBody: jsonBody(inline({
+      razorpay_order_id: S.str, razorpay_payment_id: S.str, razorpay_signature: S.str, teamId: S.id,
+    })),
+    responses: { 200: ok('Paid and submitted'), ...VALIDATION_ERROR, 402: errorResponse('Payment verification failed') },
+  }));
+
+  add('/api/coaches/payments/discount/validate', 'post', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachValidateDiscount',
+    summary: 'Price the entry with a discount code, without submitting',
+    description:
+      'Backs the "Apply" button so the coach sees the discounted total before committing. '
+      + 'No side effects. Gated on `DISCOUNT_CODE_ENABLED`; `GET /api/coaches/dashboard` '
+      + 'reports whether codes are being accepted at all. Rate limited per coach — this '
+      + 'is a guessing surface for a single shared code.',
+    requestBody: jsonBody(inline({ discountCode: S.str }, ['discountCode'])),
+    responses: {
+      200: ok('Quote', inline({
+        applied: { type: 'boolean' },
+        percent: { type: 'number', example: 100 },
+        originalAmount: { type: 'number' },
+        discountAmount: { type: 'number' },
+        payableAmount: { type: 'number', example: 0 },
+      })),
+      ...VALIDATION_ERROR,
+      ...NOT_FOUND,
+    },
+  }));
+
+  add('/api/coaches/payments/discount/redeem', 'post', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachRedeemDiscount',
+    summary: 'Redeem a 100%-off discount code and final-submit the squad',
+    description:
+      'The gateway has no zero-value order, so a fully discounted entry never reaches '
+      + 'Razorpay — this submits the team directly and records a ₹0 transaction. Every '
+      + 'guard the paid path gets from the gateway is re-checked here: the feature '
+      + 'switch, the code, the registration window and the already-submitted state.',
+    requestBody: jsonBody(inline({ discountCode: S.str }, ['discountCode'])),
+    responses: { 200: ok('Submitted at no charge'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/coaches/payments/resubmit', 'post', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachResubmitPaidTeam',
+    summary: 'Submit a reopened team again when every player is already paid for',
+    description:
+      'The Super Admin can reopen a submitted, paid team (Fix → Entries → "Submitted: No"); '
+      + 'everyone then in the squad is recorded in `paidEntries`. If the coach adds nobody new, '
+      + 'there is nothing to charge and Razorpay has no ₹0 order, so this submits the team '
+      + 'directly and records a ₹0 transaction. Refused while any player still owes.',
+    responses: { 200: ok('Submitted again, nothing charged'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  // ===================== Teams =====================
+
+  add('/api/teams', 'get', op({
+    tag: 'Teams', roles: 'coach', operationId: 'listTeams',
+    summary: 'The calling coach\'s teams',
+    responses: { 200: ok('Teams', { type: 'array', items: ref('Team') }) },
+  }));
+
+  add('/api/teams', 'post', op({
+    tag: 'Teams', roles: 'coach', operationId: 'createTeam',
+    summary: 'Create a team',
+    requestBody: jsonBody(inline({ name: S.str, description: S.str }, ['name'])),
+    responses: { 201: ok('Created', ref('Team')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/teams/{id}', 'get', op({
+    tag: 'Teams', operationId: 'getTeam',
+    summary: 'Team detail with roster',
+    description: 'Authenticated deliberately: these rosters are largely minors.',
+    parameters: [pathParam('id', 'Team id')],
+    responses: { 200: ok('Team', ref('Team')), ...NOT_FOUND },
+  }));
+
+  add('/api/teams/{id}', 'put', op({
+    tag: 'Teams', roles: 'coach', operationId: 'updateTeam',
+    summary: 'Update a team',
+    parameters: [pathParam('id', 'Team id')],
+    requestBody: jsonBody(inline({ name: S.str, description: S.str })),
+    responses: { 200: ok('Updated', ref('Team')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/teams/{id}', 'delete', op({
+    tag: 'Teams', roles: 'coach', operationId: 'deleteTeam',
+    summary: 'Delete a team',
+    parameters: [pathParam('id', 'Team id')],
+    responses: { 200: ok('Deleted'), ...NOT_FOUND },
+  }));
+
+  add('/api/teams/{id}/stats', 'get', op({
+    tag: 'Teams', operationId: 'teamStats',
+    summary: 'Team statistics',
+    parameters: [pathParam('id', 'Team id')],
+    responses: { 200: ok('Stats'), ...NOT_FOUND },
+  }));
+
+  add('/api/teams/{id}/players', 'post', op({
+    tag: 'Teams', roles: 'coach', operationId: 'teamAddPlayer',
+    summary: 'Add an athlete to a team',
+    parameters: [pathParam('id', 'Team id')],
+    requestBody: jsonBody(inline({ playerId: S.id }, ['playerId'])),
+    responses: { 200: ok('Added'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/teams/{id}/players', 'delete', op({
+    tag: 'Teams', roles: 'coach', operationId: 'teamRemovePlayer',
+    summary: 'Remove an athlete from a team',
+    parameters: [pathParam('id', 'Team id')],
+    requestBody: jsonBody(inline({ playerId: S.id }, ['playerId'])),
+    responses: { 200: ok('Removed'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  // ===================== Competitions =====================
+
+  add('/api/competitions', 'get', op({
+    tag: 'Competitions', operationId: 'listCompetitions',
+    summary: 'All competitions',
+    parameters: [...PAGINATION_QUERY, queryParam('status', S.str, 'Status filter')],
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/competitions', 'post', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'createCompetition',
+    summary: 'Create a competition',
+    requestBody: jsonBody(inline({
+      name: S.str, year: S.int, place: S.str, level: S.str,
+      startDate: { type: 'string', format: 'date-time' },
+      endDate: { type: 'string', format: 'date-time' },
+      competitionTypes: { type: 'array', items: S.competitionType },
+      ageGroups: { type: 'array', items: { type: 'object', properties: { gender: S.gender, ageGroup: S.ageGroup } } },
+      customAgeGroups: { type: 'array', description: 'Age groups this meet adds to the COP ones (Super Admin only)', items: { type: 'object', properties: { key: { type: 'string', pattern: '^Custom[A-Za-z0-9]{1,40}$' }, label: { type: 'string', maxLength: 40 }, minAge: { type: 'integer', nullable: true }, maxAge: { type: 'integer', nullable: true } } } },
+    }, ['name', 'year', 'place', 'startDate', 'endDate'])),
+    responses: { 201: ok('Created', ref('Competition')), ...VALIDATION_ERROR, 409: errorResponse('name + year + place already exists') },
+  }));
+
+  add('/api/competitions/upcoming', 'get', op({
+    tag: 'Competitions', auth: false, operationId: 'upcomingCompetitions',
+    summary: 'Upcoming competitions',
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/competitions/status/{status}', 'get', op({
+    tag: 'Competitions', operationId: 'competitionsByStatus',
+    summary: 'Competitions in a given status',
+    parameters: [pathParam('status', 'upcoming | open | ongoing | completed | cancelled')],
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/competitions/{id}', 'get', op({
+    tag: 'Competitions', operationId: 'getCompetition',
+    summary: 'Competition by id',
+    description:
+      'The entry list is **excluded by default** — ask for it with '
+      + '`?include=registeredTeams`. `registeredTeams` embeds every entered team and '
+      + 'every athlete in every entry, which is 3.0 MB on a 1000-team meet against '
+      + '2 KB for the competition itself.',
+    parameters: [
+      pathParam('id', 'Competition id'),
+      queryParam('include', { type: 'string', enum: ['registeredTeams'] }, 'Comma-separated extras to embed'),
+    ],
+    responses: { 200: ok('Competition', ref('Competition')), ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{id}', 'put', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'updateCompetition',
+    summary: 'Update a competition',
+    parameters: [pathParam('id', 'Competition id')],
+    requestBody: jsonBody(ref('Competition')),
+    responses: { 200: ok('Updated', ref('Competition')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{id}', 'delete', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'deleteCompetition',
+    summary: 'Delete a competition (soft)',
+    parameters: [pathParam('id', 'Competition id')],
+    responses: { 200: ok('Deleted'), ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{id}/status', 'patch', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'updateCompetitionStatus',
+    summary: 'Change competition status',
+    parameters: [pathParam('id', 'Competition id')],
+    requestBody: jsonBody(inline({ status: S.str }, ['status'])),
+    responses: { 200: ok('Updated'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{competitionId}/register', 'post', op({
+    tag: 'Competitions', roles: 'coach', operationId: 'competitionRegisterTeam',
+    summary: 'Enter a team',
+    parameters: [pathParam('competitionId', 'Competition id')],
+    requestBody: jsonBody(inline({ teamId: S.id }, ['teamId'])),
+    responses: { 200: ok('Entered'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{competitionId}/register/{teamId}', 'delete', op({
+    tag: 'Competitions', roles: 'coach', operationId: 'competitionUnregisterTeam',
+    summary: 'Withdraw a team',
+    parameters: [pathParam('competitionId', 'Competition id'), pathParam('teamId', 'Team id')],
+    responses: { 200: ok('Withdrawn'), ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{competitionId}/teams/{teamId}', 'get', op({
+    tag: 'Competitions', operationId: 'competitionTeamRegistration',
+    summary: 'One team\'s entry detail',
+    parameters: [pathParam('competitionId', 'Competition id'), pathParam('teamId', 'Team id')],
+    responses: { 200: ok('Entry'), ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{competitionId}/teams/{teamId}/players', 'post', op({
+    tag: 'Competitions', roles: 'coach', operationId: 'competitionAddPlayer',
+    summary: 'Add an athlete to an entry',
+    parameters: [pathParam('competitionId', 'Competition id'), pathParam('teamId', 'Team id')],
+    requestBody: jsonBody(inline({ playerId: S.id, ageGroup: S.ageGroup, gender: S.gender }, ['playerId', 'ageGroup', 'gender'])),
+    responses: { 200: ok('Added'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{competitionId}/teams/{teamId}/players/{playerId}', 'delete', op({
+    tag: 'Competitions', roles: 'coach', operationId: 'competitionRemovePlayer',
+    summary: 'Remove an athlete from an entry',
+    parameters: [pathParam('competitionId', 'Competition id'), pathParam('teamId', 'Team id'), pathParam('playerId', 'Athlete id')],
+    responses: { 200: ok('Removed'), ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{competitionId}/registrations', 'get', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'competitionRegistrations',
+    summary: 'Entries in a competition, paginated',
+    description:
+      'Paginated — this endpoint IS the entry list, so unlike the other large '
+      + 'payloads there is nothing to project away and a page is the only bound '
+      + 'available. Unpaginated it was 3.9 MB on a 1000-team meet.\n\n'
+      + '`count` is the size of this page; `total` is how many matched the filters.',
+    parameters: [
+      pathParam('competitionId', 'Competition id'),
+      queryParam('page', { type: 'integer', minimum: 1, default: 1 }, 'Page number (1-based)'),
+      queryParam('limit', { type: 'integer', minimum: 1, maximum: 200, default: 50 }, 'Rows per page'),
+      queryParam('status', S.str, 'Registration status'),
+      queryParam('ageGroup', S.ageGroup, 'Age group'),
+      queryParam('gender', S.gender, 'Gender'),
+    ],
+    responses: {
+      200: ok('Entries', inline({
+        registrations: { type: 'array', items: ref('RegisteredTeam') },
+        total: S.int,
+        page: S.int,
+        pages: S.int,
+        count: S.int,
+      })),
+      ...NOT_FOUND,
+    },
+  }));
+
+  add('/api/competitions/{id}/admins', 'post', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'competitionAssignAdmin',
+    summary: 'Assign an admin to a competition',
+    parameters: [pathParam('id', 'Competition id')],
+    requestBody: jsonBody(inline({ adminId: S.id }, ['adminId'])),
+    responses: { 200: ok('Assigned'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/competitions/{id}/admins/{adminId}', 'delete', op({
+    tag: 'Competitions', roles: 'admin, superadmin', operationId: 'competitionRemoveAdmin',
+    summary: 'Remove an admin from a competition',
+    parameters: [pathParam('id', 'Competition id'), pathParam('adminId', 'Admin id')],
+    responses: { 200: ok('Removed'), ...NOT_FOUND },
+  }));
+
+  // ===================== Admin =====================
+
+  add('/api/admin/login', 'post', op({
+    tag: 'Admin', auth: false, operationId: 'loginAdmin',
+    summary: 'Admin login',
+    requestBody: loginBody,
+    responses: { 200: ok('Logged in', ref('LoginResponse')), 401: errorResponse('Bad credentials') },
+  }));
+
+  add('/api/admin/register', 'post', op({
+    tag: 'Admin', roles: 'superadmin', operationId: 'registerAdmin',
+    summary: 'Create an admin',
+    description:
+      'Despite the path, this is NOT public — only a superadmin may create an admin.\n\n'
+      + 'Note the single `name` field: the Admin model was not split into '
+      + '`firstName`/`lastName` the way Coach, Player and JudgeAccount were.',
+    requestBody: jsonBody(inline({ name: S.str, email: S.email, password: S.str, role: { type: 'string', enum: ['admin', 'superadmin'] } }, ['name', 'email', 'password'])),
+    responses: { 201: ok('Created', ref('LoginResponse')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/dashboard', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminDashboard',
+    summary: 'Dashboard statistics',
+    description: 'Alias of `/api/admin/dashboard/stats`.',
+    responses: { 200: ok('Stats', ref('DashboardStats')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/dashboard/stats', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminDashboardStats',
+    summary: 'Dashboard statistics',
+    description:
+      'Counts are derived in memory from the competition\'s embedded `registeredTeams` '
+      + 'array, so cost grows with the size of the entry list rather than with the '
+      + 'number of counters.',
+    responses: { 200: ok('Stats', ref('DashboardStats')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  // GET /api/admin/dashboard/competition/{competitionId} was RETIRED. Its
+  // per-age-group counts filtered Team and Player by fields neither schema has,
+  // so every count it returned was 0, at two unindexed collection scans per age
+  // group. Nothing called it. Use /api/admin/dashboard/stats.
+
+  add('/api/admin/system/health', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminSystemHealth',
+    summary: 'System health as seen by an admin',
+    responses: { 200: ok('Health') },
+  }));
+
+  add('/api/admin/teams', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminListTeams',
+    summary: 'Entered teams, filtered and paginated',
+    parameters: [
+      ...PAGINATION_QUERY,
+      queryParam('ageGroup', S.ageGroup, 'Only teams with an athlete in this age group'),
+      queryParam('gender', S.gender, 'Only teams with an athlete of this gender'),
+      queryParam('status', S.str, 'Team status'),
+      queryParam('coachName', S.str, 'Coach name, case-insensitive substring'),
+      queryParam('teamName', S.str, 'Team name, case-insensitive substring'),
+    ],
+    responses: { 200: ok('Teams', inline({ teams: { type: 'array', items: ref('Team') }, total: S.int, page: S.int, pages: S.int })), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/teams/submitted', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminSubmittedTeams',
+    summary: 'Submitted teams with per-athlete scoring state',
+    description:
+      'The judge dashboard\'s team list. Returns every submitted team and, for each '
+      + 'athlete, whether the Senior Judge has finalized them and what the resolved '
+      + 'final is.\n\n'
+      + 'When `gender` and `ageGroup` are supplied, `players` contains **only that '
+      + 'category\'s athletes**. It previously returned each matching team\'s entire '
+      + 'mixed roster, which the client then filtered — 10,000 rows where the category '
+      + 'held 830. Omit the filters to get every athlete.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Teams', { type: 'array', items: ref('SubmittedTeam') }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/teams/{teamId}', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminTeamDetails',
+    summary: 'Team detail',
+    parameters: [
+      pathParam('teamId', 'Team id'),
+      queryParam('gender', S.gender, 'Restrict the roster to this gender'),
+      queryParam('ageGroup', S.ageGroup, 'Restrict the roster to this age group'),
+      queryParam('competition', S.id, 'Competition to read the entry from'),
+    ],
+    responses: { 200: ok('Team', ref('Team')), ...NOT_FOUND },
+  }));
+
+  add('/api/admin/teams/{teamId}/approve', 'put', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminApproveTeam',
+    summary: 'Approve a team',
+    parameters: [pathParam('teamId', 'Team id')],
+    responses: { 200: ok('Approved', ref('Team')), ...NOT_FOUND, 409: errorResponse('Already approved') },
+  }));
+
+  add('/api/admin/teams/{teamId}/reject', 'put', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminRejectTeam',
+    summary: 'Reject a team',
+    parameters: [pathParam('teamId', 'Team id')],
+    requestBody: jsonBody(inline({ reason: S.str }, ['reason'])),
+    responses: { 200: ok('Rejected', ref('Team')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/players', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminListPlayers',
+    summary: 'Athletes entered in the competition, filtered and paginated',
+    description:
+      'Reads the competition\'s entries (`registeredTeams`), so each row carries the '
+      + 'athlete\'s category, apparatus and team, plus the entry\'s submission and '
+      + 'payment state.\n\n'
+      + 'Paginated in the database. `status` filters on the athlete\'s ACCOUNT state, '
+      + 'which is the only status this data models — there is no per-entry status.',
+    parameters: [
+      ...PAGINATION_QUERY,
+      queryParam('ageGroup', S.ageGroup, 'Age group, as entered'),
+      queryParam('gender', S.gender, 'Gender, as entered'),
+      queryParam('teamId', S.id, 'Only athletes entered by this team'),
+      queryParam('status', { type: 'string', enum: ['active', 'inactive'] }, 'Athlete account state'),
+    ],
+    responses: { 200: ok('Athletes', inline({ players: { type: 'array', items: ref('Player') }, total: S.int, page: S.int, pages: S.int })), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/players/{playerId}', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminPlayerDetails',
+    summary: 'Athlete detail with scores',
+    parameters: [pathParam('playerId', 'Athlete id')],
+    responses: { 200: ok('Athlete', ref('Player')), ...NOT_FOUND },
+  }));
+
+  add('/api/admin/players/{playerId}/status', 'put', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminUpdatePlayerStatus',
+    summary: 'Activate or deactivate an athlete',
+    parameters: [pathParam('playerId', 'Athlete id')],
+    requestBody: jsonBody(inline({ status: S.str }, ['status'])),
+    responses: { 200: ok('Updated', ref('Player')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/players/{playerId}/team', 'put', op({
+    tag: 'Admin', roles: 'admin, superadmin', operationId: 'adminAssignPlayerTeam',
+    summary: 'Move an athlete to a team',
+    parameters: [pathParam('playerId', 'Athlete id')],
+    requestBody: jsonBody(inline({ teamId: S.id }, ['teamId'])),
+    responses: { 200: ok('Assigned', ref('Player')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/judges', 'get', op({
+    tag: 'Judges', roles: 'admin, superadmin, scorer', competitionContext: true, operationId: 'adminGetJudges',
+    summary: 'The panel seated for a category and apparatus',
+    description:
+      'PASS `apparatus`. A category holds one panel per apparatus, so without it '
+      + 'every one of them is returned end to end — and callers size the panel by '
+      + 'counting the rows, which picks the averaging method. An apparatus filter '
+      + 'answers with that apparatus\'s seats PLUS any legacy category-wide ones, '
+      + 'since those genuinely judge it too.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Seats', { type: 'array', items: ref('Judge') }) },
+  }));
+
+  add('/api/admin/judges', 'post', op({
+    tag: 'Judges', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminCreateJudge',
+    summary: 'Seat one judge',
+    description: 'The account must already exist — judges register themselves. Search with `/api/admin/judge-accounts`.',
+    requestBody: jsonBody(inline({
+      judgeAccount: S.id, judgeType: S.judgeType, judgeNo: S.int,
+      gender: S.gender, ageGroup: S.ageGroup,
+      competitionTypes: { type: 'array', items: S.competitionType },
+      apparatus: S.apparatus,
+    }, ['judgeAccount', 'judgeType', 'gender', 'ageGroup'])),
+    responses: { 201: ok('Seated', ref('Judge')), ...VALIDATION_ERROR, 409: errorResponse('Seat already filled, or this account already sits on this panel') },
+  }));
+
+  add('/api/admin/judges/bulk', 'post', op({
+    tag: 'Judges', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminSaveJudgesBulk',
+    summary: 'Seat a whole panel',
+    description:
+      'Refuses a panel missing any of Senior Judge, Judge 1, Judge 2 or Scorer. '
+      + 'The panel size (3/4/5) decides the scoring method, so a partial panel would '
+      + 'produce a believable score computed the wrong way.\n\n'
+      + 'ONE PANEL, ONE APPARATUS. `apparatus` scopes the whole panel, not a seat, '
+      + 'and a category running three of them is three calls. One person may hold '
+      + 'the same seat on each — they are different panels — but not two seats on '
+      + 'one. `competitionTypes` behaves differently: it is MERGED on update, so '
+      + 'seating the same seats again for another type widens the array in place.',
+    requestBody: jsonBody(inline({
+      ...categoryBody,
+      competition: S.id,
+      competitionTypes: { type: 'array', items: S.competitionType },
+      apparatus: S.apparatus,
+      judges: {
+        type: 'array',
+        items: inline({ judgeAccount: S.id, judgeType: S.judgeType, judgeNo: S.int }),
+      },
+    }, ['gender', 'ageGroup', 'judges'])),
+    responses: { 200: ok('Panel written', inline({ created: { type: 'array', items: {} }, updated: { type: 'array', items: {} }, errors: { type: 'array', items: {} } })), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/judges/summary', 'get', op({
+    tag: 'Judges', roles: 'admin, superadmin, scorer', competitionContext: true, operationId: 'adminJudgesSummary',
+    summary: 'Panel coverage across every category',
+    description:
+      'Which categories have a complete panel and which are already started.\n\n'
+      + 'Each `competitionTypes[slug]` entry carries `judges` (every seat in the '
+      + 'category, whatever apparatus) and `byApparatus` (one bucket per apparatus '
+      + 'the meet runs, each with its own `hasMinimumJudges`). The entry\'s own '
+      + '`hasMinimumJudges` — the flag behind the dashboard\'s Start button — is '
+      + 'true only when EVERY bucket is, because a category whose Pole panel is '
+      + 'complete and whose Rope panel is not cannot be scored. A meet declaring '
+      + 'no apparatus for a type has no buckets and falls back to the flat list.',
+    responses: { 200: ok('Summary') },
+  }));
+
+  add('/api/admin/judges/{judgeId}', 'put', op({
+    tag: 'Judges', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminUpdateJudge',
+    summary: 'Change who sits in a seat',
+    parameters: [pathParam('judgeId', 'Seat id')],
+    requestBody: jsonBody(inline({ judgeAccount: S.id, judgeType: S.judgeType, isActive: S.bool })),
+    responses: { 200: ok('Updated', ref('Judge')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/judges/{judgeId}', 'delete', op({
+    tag: 'Judges', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminDeleteJudge',
+    summary: 'Empty a seat',
+    description: 'Removes the person, not the slot.',
+    parameters: [pathParam('judgeId', 'Seat id')],
+    responses: { 200: ok('Seat emptied'), ...NOT_FOUND },
+  }));
+
+  add('/api/admin/judge-accounts', 'get', op({
+    tag: 'Judges', roles: 'admin, superadmin', operationId: 'adminSearchJudgeAccounts',
+    summary: 'Search registered judges to seat',
+    description:
+      'An empty result normally means the person has not registered yet — admins cannot '
+      + 'create judge logins.\n\n'
+      + '**Known defect — matches e-mail only.** The search is written against a `name` '
+      + 'field, and JudgeAccount stores `firstName`/`lastName`. Searching a judge\'s '
+      + 'actual first name returns nothing; search by e-mail until this is fixed. '
+      + 'Terms shorter than 2 characters return an empty list by design.',
+    parameters: [queryParam('q', S.str, 'E-mail fragment (see the note on names). Minimum 2 characters.')],
+    responses: { 200: ok('Accounts', { type: 'array', items: ref('UserSummary') }) },
+  }));
+
+  add('/api/admin/scores/save', 'post', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminSaveScores',
+    summary: 'Write a judge slip or a whole score sheet',
+    description: 'Same handler as `/api/judge/scores/save`, `/api/superadmin/scores/save` and `/api/public/save-score`.',
+    requestBody: jsonBody(ref('SaveScoreRequest')),
+    responses: { 200: ok('Saved', ref('Score')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/scores/team', 'get', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminTeamScores',
+    summary: 'Team-by-team scores for a category',
+    description:
+      'When `gender` and `ageGroup` are supplied, each team\'s `players` contains '
+      + 'only that category\'s athletes — it previously returned the whole mixed '
+      + 'roster, which both consumers then filtered on arrival.\n\n'
+      + 'Each `judgeSlips[]` entry keeps its `breakdown` here, unlike '
+      + '`/api/public/scores`: the judge panel-review edit flow reads it to restore a '
+      + 'judge\'s exact element selections.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Teams with scores', { type: 'array', items: {} }) },
+  }));
+
+  add('/api/admin/scores/individual', 'get', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminIndividualScores',
+    summary: 'Athlete-by-athlete scores for a category',
+    description:
+      '**Send `competitionType` in the DISPLAY form here** (`Competition I`), not the '
+      + 'slug (`competition_1`). Unlike `/api/admin/scores/team`, this endpoint does '
+      + 'not normalize the value before querying, so the slug matches no stored '
+      + 'document and the response is an empty list rather than an error.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Athletes with scores', { type: 'array', items: {} }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/scores/lock', 'put', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminLockScores',
+    summary: 'Lock every score sheet in an age group',
+    description: 'A locked sheet is what makes results public.',
+    requestBody: jsonBody(inline({ ageGroup: S.ageGroup }, ['ageGroup'])),
+    responses: { 200: ok('Locked'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/scores/{scoreId}/unlock', 'put', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminUnlockScore',
+    summary: 'Unlock one score sheet for correction',
+    parameters: [pathParam('scoreId', 'Score document id')],
+    responses: { 200: ok('Unlocked'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/scores/{scoreId}/players/{playerId}/unlock', 'put', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminUnlockPlayerForJudges',
+    summary: 'Reopen one athlete for the judges',
+    description: "Clears the Senior Judge's Final Submit on that athlete and the Scorer's lock on that apparatus, so the panel can correct their slips. Marks are untouched; the published result is withdrawn until the next Final Submit. An admin can only reach sheets in their own meet.",
+    parameters: [pathParam('scoreId', 'Score document id'), pathParam('playerId', 'Athlete id')],
+    requestBody: jsonBody(inline({ apparatus: { type: 'string' } }, [])),
+    responses: { 200: ok('Reopened'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/scores/recalculate', 'post', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminRecalculateScores',
+    summary: 'Recompute every score in an age group',
+    description: 'Re-runs the COP calculation over the stored slips. Rewrites each matching document.',
+    requestBody: jsonBody(inline({ ageGroup: S.ageGroup }, ['ageGroup'])),
+    responses: { 200: ok('Recalculated', inline({ recalculated: S.int })), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/rankings/team', 'get', op({
+    tag: 'Rankings', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminTeamRankings',
+    summary: 'Team rankings',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Rankings', { type: 'array', items: {} }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/scores/team-rankings', 'get', op({
+    tag: 'Rankings', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminTeamRankingsAlias',
+    summary: 'Team rankings (alias)',
+    description: 'Identical to `/api/admin/rankings/team`.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Rankings', { type: 'array', items: {} }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/rankings/individual', 'get', op({
+    tag: 'Rankings', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminIndividualRankings',
+    summary: 'Individual rankings',
+    description: 'One row per performance, ranked within its apparatus. Competitors level on `finalScore` are separated by panel size — time on a 3-judge panel, senior judge score then the panel mean on 4/5 — and those the rules cannot separate share a placing.',
+    parameters: [queryParam('ageGroup', S.ageGroup, 'Age group')],
+    responses: { 200: ok('Rankings', { type: 'array', items: {} }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/lots', 'get', op({
+    tag: 'Running order', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminGetLots',
+    summary: 'The running order for a category',
+    parameters: [
+      queryParam('gender', S.gender, 'Category gender', true),
+      queryParam('ageGroup', S.ageGroup, 'Category age group', true),
+      queryParam('competitionType', S.competitionType, 'Competition type', true),
+    ],
+    responses: { 200: ok('Running order', ref('RunningOrder')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/lots/draw', 'post', op({
+    tag: 'Running order', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminDrawLots',
+    summary: 'Draw lots',
+    description: 'Shuffles the submitted teams and stamps lot numbers. Redrawing replaces the previous draw.',
+    requestBody: jsonBody(inline({ ...categoryBody, includePlayers: S.bool }, ['gender', 'ageGroup', 'competitionType'])),
+    responses: { 200: ok('Drawn', ref('RunningOrder')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/lots/teams', 'put', op({
+    tag: 'Running order', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminSetTeamOrder',
+    summary: 'Set the team running order',
+    requestBody: jsonBody(inline({ ...categoryBody, teamIds: { type: 'array', items: S.id, minItems: 1, maxItems: 500 } }, ['gender', 'ageGroup', 'competitionType', 'teamIds'])),
+    responses: { 200: ok('Order set', ref('RunningOrder')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/lots/players', 'put', op({
+    tag: 'Running order', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminSetPlayerOrder',
+    summary: 'Set one team\'s athlete order',
+    requestBody: jsonBody(inline({ ...categoryBody, teamId: S.id, playerIds: { type: 'array', items: S.id, minItems: 1, maxItems: 500 } }, ['gender', 'ageGroup', 'competitionType', 'teamId', 'playerIds'])),
+    responses: { 200: ok('Order set', ref('RunningOrder')), ...VALIDATION_ERROR },
+  }));
+
+  // Lucky draw (COP 1.12.4): the physical draw's result for a tie the rules left standing.
+  const drawStanding = { ...categoryBody, apparatus: { type: 'string', enum: APPARATUS } };
+  const drawOrder = { type: 'array', items: S.id, minItems: 2, maxItems: 100, description: 'Player ids, first place first' };
+  const drawGroupKey = { type: 'string', description: 'tieBreakInfo.tieGroupKey of the group: sorted player ids, comma-joined' };
+
+  add('/api/admin/tie-break/draws', 'post', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminRecordTieBreakDraw',
+    summary: 'Record the lucky draw for one tied group',
+    description: 'Only for a group the rules leave tied right now (tieBreakInfo.awaitingLuckyDraw). Recording again replaces the order.',
+    requestBody: jsonBody(inline({ ...drawStanding, order: drawOrder, notes: { type: 'string', maxLength: 500 } }, ['gender', 'ageGroup', 'competitionType', 'apparatus', 'order'])),
+    responses: { 200: ok('Recorded'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/tie-break/draws', 'delete', op({
+    tag: 'Scores', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminClearTieBreakDraw',
+    summary: 'Remove a recorded lucky draw',
+    requestBody: jsonBody(inline({ ...drawStanding, groupKey: drawGroupKey }, ['gender', 'ageGroup', 'competitionType', 'apparatus', 'groupKey'])),
+    responses: { 200: ok('Cleared'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/age-groups/start', 'post', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminStartAgeGroup',
+    summary: 'Open a category for scoring',
+    description: 'Refuses unless the panel for that category is complete.',
+    requestBody: jsonBody(inline(categoryBody, ['gender', 'ageGroup', 'competitionType'])),
+    responses: { 200: ok('Started'), ...VALIDATION_ERROR, 409: errorResponse('Panel incomplete, or already started') },
+  }));
+
+  add('/api/admin/age-groups/{ageGroup}/end', 'post', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminEndAgeGroup',
+    summary: 'Close a category and lock its scores',
+    parameters: [pathParam('ageGroup', 'Age group')],
+    responses: { 200: ok('Ended'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/admin/age-groups/status', 'get', op({
+    tag: 'Admin', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminAgeGroupStatus',
+    summary: 'Which categories are open, started or ended',
+    responses: { 200: ok('Status'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/transactions', 'get', op({
+    tag: 'Payments', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminTransactions',
+    summary: 'Payments, filtered and paginated',
+    description:
+      'Each row carries `competition.registeredTeams` containing **only that '
+      + 'transaction\'s own entry**, with its athletes named. The whole competition '
+      + 'used to be embedded on every row — roughly 3 MB each, so a ten-row page ran to '
+      + 'tens of megabytes.',
+    parameters: [
+      ...PAGINATION_QUERY,
+      queryParam('status', S.str, 'Payment status'),
+      queryParam('startDate', { type: 'string', format: 'date' }, 'Range start'),
+      queryParam('endDate', { type: 'string', format: 'date' }, 'Range end'),
+      queryParam('teamId', S.id, 'Team'),
+      queryParam('coachId', S.id, 'Coach'),
+    ],
+    responses: { 200: ok('Transactions', inline({ transactions: { type: 'array', items: ref('Transaction') }, total: S.int, page: S.int, pages: S.int })), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/transactions/summary', 'get', op({
+    tag: 'Payments', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminPaymentSummary',
+    summary: 'Payment totals for a competition',
+    responses: { 200: ok('Summary'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/admin/transactions/{transactionId}', 'get', op({
+    tag: 'Payments', roles: 'admin, superadmin', competitionContext: true, operationId: 'adminTransactionDetails',
+    summary: 'One payment',
+    parameters: [pathParam('transactionId', 'Transaction id')],
+    responses: { 200: ok('Transaction', ref('Transaction')), ...NOT_FOUND },
+  }));
+
+  // ===================== Judge =====================
+
+  add('/api/judge/login', 'post', op({
+    tag: 'Judge', auth: false, operationId: 'loginJudge',
+    summary: 'Judge login',
+    description:
+      'Rate limited per USERNAME rather than per IP: a whole panel behind one venue '
+      + 'NAT address must not throttle itself at sign-in.',
+    requestBody: loginBody,
+    responses: { 200: ok('Logged in', ref('LoginResponse')), 401: errorResponse('Bad credentials') },
+  }));
+
+  add('/api/judge/register', 'post', op({
+    tag: 'Judge', auth: false, operationId: 'registerJudge',
+    summary: 'Judge self-registration',
+    description: 'A new account holds no assignments, and an account with no assignments can read nothing about any competition.',
+    requestBody: jsonBody(inline({
+      firstName: S.str, lastName: S.str, email: S.email, phone: S.str,
+      password: { type: 'string', minLength: 8 },
+    }, ['firstName', 'lastName', 'email', 'password'])),
+    responses: { 201: ok('Registered', ref('LoginResponse')), ...VALIDATION_ERROR, 409: errorResponse('E-mail already registered') },
+  }));
+
+  add('/api/judge/profile', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeProfile',
+    summary: 'Own profile',
+    responses: { 200: ok('Profile', ref('UserSummary')) },
+  }));
+
+  add('/api/judge/profile', 'put', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeUpdateProfile',
+    summary: 'Update own profile',
+    requestBody: jsonBody(inline({ firstName: S.str, lastName: S.str, phone: S.str })),
+    responses: { 200: ok('Updated', ref('UserSummary')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/judge/profile/password', 'put', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeChangePassword',
+    summary: 'Change own password',
+    requestBody: jsonBody(inline({ currentPassword: S.str, newPassword: { type: 'string', minLength: 8 } }, ['currentPassword', 'newPassword'])),
+    responses: { 200: ok('Changed'), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/judge/assignments', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeAssignments',
+    summary: 'Every panel seat this account holds',
+    description: 'Across competitions. The same person is routinely Senior Judge in one category and Judge 2 in another.',
+    responses: { 200: ok('Assignments', { type: 'array', items: ref('Judge') }) },
+  }));
+
+  add('/api/judge/competitions', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeCompetitions',
+    summary: 'Competitions this judge is seated in',
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/judge/competition/{competitionId}', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeCompetitionDetails',
+    summary: 'Competition detail for a judge',
+    parameters: [pathParam('competitionId', 'Competition id')],
+    responses: { 200: ok('Competition', ref('Competition')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+
+  add('/api/judge/competition/{competitionId}/set', 'put', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeSetCompetition',
+    summary: 'Bind the judge session to a competition',
+    parameters: [pathParam('competitionId', 'Competition id')],
+    responses: { 200: ok('Context set', ref('LoginResponse')), ...VALIDATION_ERROR },
+  }));
+
+  // GET /api/judge/teams was RETIRED. It queried Team by competition,
+  // ageGroup, gender and isSubmitted — none of them paths on Team — so it
+  // returned an empty list to every caller. Use /api/public/submitted-teams,
+  // which is what the judge client already calls.
+
+  add('/api/judge/teams/{teamId}/players', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeTeamPlayers',
+    summary: 'One team\'s athletes in a category',
+    parameters: [pathParam('teamId', 'Team id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Athletes', { type: 'array', items: {} }), ...VALIDATION_ERROR },
+  }));
+
+  /*
+   * POST /api/judge/scores, PUT /api/judge/scores/{scoreId} and
+   * GET /api/judge/scores/my are retired — they wrote and read a flat score
+   * shape the Score schema has no paths for, so one stored nothing and the
+   * other always 500'd. `/api/judge/scores/save` below is the real one.
+   */
+
+  add('/api/judge/scores/save', 'post', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeSaveScores',
+    summary: 'Write a slip or a score sheet (shared handler)',
+    description:
+      'The panel seat written is resolved from the caller\'s own assignment for THIS '
+      + 'category — never from the body. `isFinalSubmit` is refused unless the caller '
+      + 'is the Senior Judge.',
+    requestBody: jsonBody(ref('SaveScoreRequest')),
+    responses: { 200: ok('Saved', ref('Score')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/judge/scores/team', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgeTeamScores',
+    summary: 'Team scores (Scorer interface)',
+    description:
+      'Same handler as `/api/admin/scores/team`. With `gender` and `ageGroup`, each '
+      + 'team\'s `players` is narrowed to that category.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Teams with scores', { type: 'array', items: {} }) },
+  }));
+
+  add('/api/judge/judges', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgePanel',
+    summary: 'The panel this judge sits on',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Seats', { type: 'array', items: ref('Judge') }) },
+  }));
+
+  add('/api/judge/judges/summary', 'get', op({
+    tag: 'Judge', roles: 'judge', operationId: 'judgePanelSummary',
+    summary: 'Panel coverage summary',
+    responses: { 200: ok('Summary') },
+  }));
+
+  add('/api/judge/lots', 'get', op({
+    tag: 'Running order', roles: 'judge (any seat)', operationId: 'judgeGetLots',
+    summary: 'Read the running order',
+    description: 'Every judge on the panel can read the order they are judging to; only the Senior Judge and Scorer can change it.',
+    parameters: [
+      queryParam('gender', S.gender, 'Category gender', true),
+      queryParam('ageGroup', S.ageGroup, 'Category age group', true),
+      queryParam('competitionType', S.competitionType, 'Competition type', true),
+    ],
+    responses: { 200: ok('Running order', ref('RunningOrder')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/judge/lots/teams', 'put', op({
+    tag: 'Running order', roles: 'Senior Judge or Scorer of THIS panel', operationId: 'judgeSetTeamOrder',
+    summary: 'Re-sequence the teams',
+    description: 'Two checks: the role guard, then a service-side assertion that the caller is seated on the category being reordered.',
+    requestBody: jsonBody(inline({ ...categoryBody, teamIds: { type: 'array', items: S.id } }, ['gender', 'ageGroup', 'competitionType', 'teamIds'])),
+    responses: { 200: ok('Order set', ref('RunningOrder')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/judge/lots/players', 'put', op({
+    tag: 'Running order', roles: 'Senior Judge or Scorer of THIS panel', operationId: 'judgeSetPlayerOrder',
+    summary: 'Re-sequence one team\'s athletes',
+    requestBody: jsonBody(inline({ ...categoryBody, teamId: S.id, playerIds: { type: 'array', items: S.id } }, ['gender', 'ageGroup', 'competitionType', 'teamId', 'playerIds'])),
+    responses: { 200: ok('Order set', ref('RunningOrder')), ...VALIDATION_ERROR },
+  }));
+
+  // ===================== Public =====================
+
+  add('/api/public/competitions', 'get', op({
+    tag: 'Public', auth: false, operationId: 'publicCompetitions',
+    summary: 'Competitions for the public site',
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  }));
+
+  add('/api/public/cop-rules', 'get', op({
+    tag: 'Public', auth: false, operationId: 'publicCopRules',
+    summary: 'The COP scoring constants',
+    description:
+      'Ceilings, element values, difficulty mixes, tolerance tiers, the 90s '
+      + 'time-deduction table and the per-apparatus combination checklists. Anonymous '
+      + 'on purpose: it is reference data with no competition, team or athlete in it, '
+      + 'and the judge client needs it before a session exists.',
+    responses: { 200: ok('COP rules') },
+  }));
+
+  add('/api/public/teams', 'get', op({
+    tag: 'Public', auth: false, operationId: 'publicTeams',
+    summary: 'Submitted teams for the public score filters',
+    description: 'The parameter is `competitionId`. Omitting it returns an empty list, not every team.',
+    parameters: [queryParam('competitionId', S.id, 'Competition id')],
+    responses: { 200: ok('Teams', { type: 'array', items: ref('SubmittedTeam') }), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/public/scores', 'get', op({
+    tag: 'Public', auth: false, operationId: 'publicScores',
+    summary: 'Published results',
+    description:
+      'Two gates: the Scorer has LOCKED the sheet, and the Senior Judge has finalized '
+      + 'that athlete. The second is applied per row — locking a sheet does not '
+      + 'retroactively publish a performer nobody signed off.\n\n'
+      + '`competitionId` is **required**. It used to be optional, and omitting it '
+      + 'returned every published score in the database — 19.5 MB on one 1000-team '
+      + 'meet, with no bound across competitions.\n\n'
+      + 'Each `judgeSlips[]` entry carries its section totals but **not** its '
+      + '`breakdown` (the A/B/C element counts and combination checklist). That exists '
+      + 'so the judge who wrote a slip can re-open it for edit, and is 43% of a row.',
+    parameters: [
+      queryParam('competitionId', S.id, 'Competition id', true),
+      queryParam('teamId', S.id, 'Restrict to one team\'s athletes'),
+      ...CATEGORY_QUERY,
+    ],
+    responses: { 200: ok('Published scores', { type: 'array', items: ref('Score') }), ...VALIDATION_ERROR },
+  }));
+
+  // ── Stats (profile Stats tabs, admin Judge fairness board) ──
+  const statsObject = { type: 'object', additionalProperties: true };
+  add('/api/stats/player', 'get', op({
+    tag: 'Stats', roles: 'player', operationId: 'statsPlayer',
+    summary: "The signed-in player's published performances",
+    description:
+      'Every performance the Senior Judge has Final Submitted and the Scorer has locked, '
+      + 'with the published Difficulty / Combination / Execution average, the board rank, '
+      + 'the category average and best, the combination checklist and the panel by seat. '
+      + 'Never names a judge.',
+    responses: { 200: ok('Player stats', statsObject) },
+  }));
+  add('/api/stats/coach', 'get', op({
+    tag: 'Stats', roles: 'coach', operationId: 'statsCoach',
+    summary: "Published performances of every athlete on the coach's teams",
+    description: "Per-athlete headline numbers, every performance, and each team's Team Championship place per meet.",
+    responses: { 200: ok('Coach stats', statsObject) },
+  }));
+  add('/api/stats/judge', 'get', op({
+    tag: 'Stats', roles: 'judge', operationId: 'statsJudge',
+    summary: "The signed-in judge's marking pattern",
+    description:
+      'Each published mark compared with the median of the other judges on that panel: '
+      + 'overall strictness, per section, per meet, and per team (lean = deviation on the team '
+      + 'minus deviation on every other team).',
+    parameters: [queryParam('competition', S.id, 'Limit to one competition', false)],
+    responses: { 200: ok('Judge stats', statsObject), ...VALIDATION_ERROR },
+  }));
+  add('/api/stats/judge-fairness', 'get', op({
+    tag: 'Stats', roles: 'admin, superadmin', operationId: 'statsJudgeFairness',
+    summary: 'Judge × team leans for a meet',
+    description:
+      'An admin must name one of their own competitions; a super admin may name any or none (all meets). '
+      + 'A lean is flagged only with at least 6 recorded performances, a size of at least 0.30 '
+      + 'and a 90% confidence interval that excludes zero.',
+    parameters: [queryParam('competition', S.id, 'Competition id (required for admins)', false)],
+    responses: { 200: ok('Judge fairness board', statsObject), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/public/team-championship', 'get', op({
+    tag: 'Public', auth: false, operationId: 'publicTeamChampionship',
+    summary: 'Team Championship standing for one category',
+    description:
+      'Competition I only, from the same published scores as `/api/public/scores`. '
+      + 'Per apparatus, a 4-player team counts its best 3 scores and a 6-player team '
+      + 'its best 5; the team total is the sum of those subtotals. Teams level on '
+      + 'the total share a placing.',
+    parameters: [
+      queryParam('competitionId', S.id, 'Competition id', true),
+      queryParam('gender', { type: 'string', enum: GENDERS }, 'Category gender', true),
+      queryParam('ageGroup', AGE_GROUP_SCHEMA, 'Category age group', true),
+    ],
+    responses: {
+      200: ok('Ranked teams', {
+        type: 'array',
+        items: inline({
+          rank: S.int,
+          teamId: S.id,
+          teamName: S.str,
+          teamSize: S.int,
+          countedPerApparatus: S.int,
+          totalScore: S.num,
+          apparatus: { type: 'array', items: inline({ apparatus: S.apparatus, subtotal: S.num, counted: { type: 'array', items: { type: 'object' } }, dropped: { type: 'array', items: { type: 'object' } } }) },
+        }),
+      }),
+      ...VALIDATION_ERROR,
+    },
+  }));
+
+  add('/api/public/judges', 'get', op({
+    tag: 'Public', roles: 'judge, admin, superadmin', operationId: 'publicJudges',
+    summary: 'The panel for a category',
+    description: 'Under `/api/public` for backward compatibility with the deployed judge client, but NOT public — 401 when anonymous.',
+    parameters: CATEGORY_QUERY,
+    responses: { 200: ok('Seats', { type: 'array', items: ref('Judge') }) },
+  }));
+
+  add('/api/public/submitted-teams', 'get', op({
+    tag: 'Public', roles: 'judge, admin, superadmin', operationId: 'publicSubmittedTeams',
+    summary: 'Submitted teams',
+    description:
+      'Under `/api/public` for backward compatibility, but NOT public — 401 when anonymous.\n\n'
+      + 'Accepts either `competition` or `competitionId`, and falls back to the '
+      + 'competition in the token.',
+    parameters: [
+      queryParam('competition', S.id, 'Competition id'),
+      queryParam('competitionId', S.id, 'Competition id (alternative spelling)'),
+      ...CATEGORY_QUERY,
+    ],
+    responses: { 200: ok('Teams', { type: 'array', items: ref('SubmittedTeam') }) },
+  }));
+
+  add('/api/public/save-score', 'post', op({
+    tag: 'Public', roles: 'judge, admin, superadmin', operationId: 'publicSaveScore',
+    summary: 'Write a judge slip',
+    description: 'Under `/api/public` for backward compatibility, but NOT public — 401 when anonymous.',
+    requestBody: jsonBody(ref('SaveScoreRequest')),
+    responses: { 200: ok('Saved', ref('Score')), ...VALIDATION_ERROR },
+  }));
+
+  add('/api/public/payments/razorpay/webhook', 'post', op({
+    tag: 'Payments', auth: false, operationId: 'razorpayWebhookPublic',
+    summary: 'Razorpay webhook',
+    description: 'Authenticated by HMAC signature over the raw body, not by a session.',
+    parameters: [{ name: 'X-Razorpay-Signature', in: 'header', required: true, schema: S.str, description: 'HMAC-SHA256 of the raw body' }],
+    requestBody: jsonBody({ type: 'object', additionalProperties: true }),
+    responses: { 200: ok('Reconciled'), 400: errorResponse('Signature mismatch or malformed payload') },
+  }));
+
+  add('/api/webhooks/razorpay', 'post', op({
+    tag: 'Payments', auth: false, operationId: 'razorpayWebhook',
+    summary: 'Razorpay webhook (preferred path)',
+    description: 'Same handler as `/api/public/payments/razorpay/webhook`.',
+    parameters: [{ name: 'X-Razorpay-Signature', in: 'header', required: true, schema: S.str, description: 'HMAC-SHA256 of the raw body' }],
+    requestBody: jsonBody({ type: 'object', additionalProperties: true }),
+    responses: { 200: ok('Reconciled'), 400: errorResponse('Signature mismatch or malformed payload') },
+  }));
+
+  // ===================== Super admin =====================
+
+  const sa = (path, method, config) => add(path, method, op({
+    tag: 'Super admin', roles: 'superadmin', ...config,
+  }));
+
+  sa('/api/superadmin/login', 'post', {
+    auth: false, operationId: 'loginSuperAdmin',
+    summary: 'Super admin login',
+    requestBody: loginBody,
+    responses: { 200: ok('Logged in', ref('LoginResponse')), 401: errorResponse('Bad credentials') },
+  });
+
+  sa('/api/superadmin/dashboard', 'get', {
+    operationId: 'superAdminDashboard', summary: 'Platform dashboard',
+    responses: { 200: ok('Dashboard') },
+  });
+
+  sa('/api/superadmin/stats', 'get', {
+    operationId: 'superAdminStats', summary: 'Platform-wide counts',
+    responses: { 200: ok('Stats') },
+  });
+
+  sa('/api/superadmin/admins', 'get', {
+    operationId: 'superAdminListAdmins', summary: 'All admins',
+    responses: { 200: ok('Admins', { type: 'array', items: ref('UserSummary') }) },
+  });
+
+  sa('/api/superadmin/admins', 'post', {
+    operationId: 'superAdminCreateAdmin', summary: 'Create an admin',
+    description: 'The Admin model carries a single `name`, not the `firstName`/`lastName` pair the other person models use.',
+    requestBody: jsonBody(inline({ name: S.str, email: S.email, password: S.str, role: { type: 'string', enum: ['admin', 'superadmin'] } }, ['name', 'email', 'password'])),
+    responses: { 201: ok('Created', ref('UserSummary')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/admins/{adminId}', 'put', {
+    operationId: 'superAdminUpdateAdmin', summary: 'Update an admin',
+    parameters: [pathParam('adminId', 'Admin id')],
+    requestBody: jsonBody(inline({ name: S.str, email: S.email, isActive: S.bool })),
+    responses: { 200: ok('Updated', ref('UserSummary')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/admins/{adminId}', 'delete', {
+    operationId: 'superAdminDeleteAdmin', summary: 'Delete an admin',
+    parameters: [pathParam('adminId', 'Admin id')],
+    responses: { 200: ok('Deleted'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/coaches', 'get', {
+    operationId: 'superAdminListCoaches', summary: 'All coaches',
+    responses: { 200: ok('Coaches', { type: 'array', items: ref('UserSummary') }) },
+  });
+
+  sa('/api/superadmin/coaches/{coachId}/status', 'put', {
+    operationId: 'superAdminCoachStatus', summary: 'Activate a coach',
+    description: 'Activate only — `isActive: false` is refused with 400. A coach owns the requests of the players they registered, so deactivating one would strand them.',
+    parameters: [pathParam('coachId', 'Coach id')],
+    requestBody: jsonBody(inline({ isActive: { type: 'boolean', enum: [true] } }, ['isActive'])),
+    responses: { 200: ok('Updated'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/teams', 'get', {
+    operationId: 'superAdminListTeams', summary: 'All teams',
+    responses: { 200: ok('Teams', { type: 'array', items: ref('Team') }) },
+  });
+
+  sa('/api/superadmin/teams/submitted', 'get', {
+    operationId: 'superAdminSubmittedTeams', summary: 'Submitted teams',
+    parameters: [queryParam('competition', S.id, 'Competition id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Teams', { type: 'array', items: ref('SubmittedTeam') }) },
+  });
+
+  sa('/api/superadmin/submitted-teams', 'get', {
+    operationId: 'superAdminSubmittedTeamsAlias', summary: 'Submitted teams (alias)',
+    parameters: [queryParam('competition', S.id, 'Competition id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Teams', { type: 'array', items: ref('SubmittedTeam') }) },
+  });
+
+  sa('/api/superadmin/teams/{teamId}', 'get', {
+    operationId: 'superAdminTeamDetails', summary: 'Team detail',
+    parameters: [pathParam('teamId', 'Team id')],
+    responses: { 200: ok('Team', ref('Team')), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/teams/{teamId}', 'delete', {
+    operationId: 'superAdminDeleteTeam', summary: 'Delete a team',
+    parameters: [pathParam('teamId', 'Team id')],
+    responses: { 200: ok('Deleted'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/competitions', 'get', {
+    operationId: 'superAdminListCompetitions', summary: 'All competitions',
+    responses: { 200: ok('Competitions', { type: 'array', items: ref('Competition') }) },
+  });
+
+  sa('/api/superadmin/competitions', 'post', {
+    operationId: 'superAdminCreateCompetition', summary: 'Create a competition',
+    requestBody: jsonBody(ref('Competition')),
+    responses: { 201: ok('Created', ref('Competition')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/competitions/{id}', 'get', {
+    operationId: 'superAdminGetCompetition', summary: 'Competition by id',
+    parameters: [pathParam('id', 'Competition id')],
+    responses: { 200: ok('Competition', ref('Competition')), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/competitions/{id}', 'put', {
+    operationId: 'superAdminUpdateCompetition', summary: 'Update a competition',
+    parameters: [pathParam('id', 'Competition id')],
+    requestBody: jsonBody(ref('Competition')),
+    responses: { 200: ok('Updated', ref('Competition')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/competitions/{id}', 'delete', {
+    operationId: 'superAdminDeleteCompetition', summary: 'Delete a competition',
+    parameters: [pathParam('id', 'Competition id')],
+    responses: { 200: ok('Deleted'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/competitions/{id}/admins', 'post', {
+    operationId: 'superAdminAssignAdmin', summary: 'Assign an admin to a competition',
+    parameters: [pathParam('id', 'Competition id')],
+    requestBody: jsonBody(inline({ adminId: S.id }, ['adminId'])),
+    responses: { 200: ok('Assigned'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/competitions/{id}/admins/{adminId}', 'delete', {
+    operationId: 'superAdminRemoveAdmin', summary: 'Remove an admin from a competition',
+    parameters: [pathParam('id', 'Competition id'), pathParam('adminId', 'Admin id')],
+    responses: { 200: ok('Removed'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/players/add', 'post', {
+    operationId: 'superAdminAddPlayer', summary: 'Add an athlete to an entry directly',
+    requestBody: jsonBody(inline({ competitionId: S.id, teamId: S.id, playerId: S.id, ageGroup: S.ageGroup, gender: S.gender })),
+    responses: { 200: ok('Added'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/players/payment/create', 'post', {
+    operationId: 'superAdminCreatePlayerPayment', summary: 'Create a per-athlete payment order',
+    requestBody: jsonBody(inline({ competitionId: S.id, teamId: S.id, playerId: S.id })),
+    responses: { 200: ok('Order created'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/players/payment/verify', 'post', {
+    operationId: 'superAdminVerifyPlayerPayment', summary: 'Verify a per-athlete payment and add the athlete',
+    requestBody: jsonBody(inline({ razorpay_order_id: S.str, razorpay_payment_id: S.str, razorpay_signature: S.str })),
+    responses: { 200: ok('Verified'), ...VALIDATION_ERROR, 402: errorResponse('Payment verification failed') },
+  });
+
+  sa('/api/superadmin/transactions', 'get', {
+    operationId: 'superAdminTransactions', summary: 'All payments',
+    parameters: PAGINATION_QUERY,
+    responses: { 200: ok('Transactions', { type: 'array', items: ref('Transaction') }) },
+  });
+
+  sa('/api/superadmin/judges', 'get', {
+    operationId: 'superAdminGetJudges', summary: 'The panel for a category',
+    parameters: [queryParam('competition', S.id, 'Competition id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Seats', { type: 'array', items: ref('Judge') }) },
+  });
+
+  sa('/api/superadmin/judges', 'post', {
+    operationId: 'superAdminCreateJudge', summary: 'Seat one judge',
+    requestBody: jsonBody(inline({ competition: S.id, judgeAccount: S.id, judgeType: S.judgeType, gender: S.gender, ageGroup: S.ageGroup })),
+    responses: { 201: ok('Seated', ref('Judge')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/judges/bulk', 'post', {
+    operationId: 'superAdminSaveJudgesBulk', summary: 'Seat a whole panel',
+    requestBody: jsonBody(inline({ competition: S.id, ...categoryBody, judges: { type: 'array', items: {} } })),
+    responses: { 200: ok('Panel written'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/judges/{judgeId}', 'put', {
+    operationId: 'superAdminUpdateJudge', summary: 'Change who sits in a seat',
+    parameters: [pathParam('judgeId', 'Seat id')],
+    requestBody: jsonBody(inline({ judgeAccount: S.id, judgeType: S.judgeType })),
+    responses: { 200: ok('Updated', ref('Judge')), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/judges/{judgeId}', 'delete', {
+    operationId: 'superAdminDeleteJudge', summary: 'Empty a seat',
+    parameters: [pathParam('judgeId', 'Seat id')],
+    responses: { 200: ok('Seat emptied'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/judge-accounts', 'get', {
+    operationId: 'superAdminSearchJudgeAccounts', summary: 'Search registered judges',
+    parameters: [queryParam('q', S.str, 'Name or e-mail fragment')],
+    responses: { 200: ok('Accounts', { type: 'array', items: ref('UserSummary') }) },
+  });
+
+  sa('/api/superadmin/judges/summary', 'get', {
+    operationId: 'superAdminJudgesSummary', summary: 'Panel coverage',
+    parameters: [queryParam('competition', S.id, 'Competition id')],
+    responses: { 200: ok('Summary') },
+  });
+
+  sa('/api/superadmin/scores/team', 'get', {
+    operationId: 'superAdminTeamScores', summary: 'Team scores',
+    parameters: [queryParam('competition', S.id, 'Competition id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Teams with scores', { type: 'array', items: {} }) },
+  });
+
+  sa('/api/superadmin/scores/individual', 'get', {
+    operationId: 'superAdminIndividualScores', summary: 'Individual scores',
+    parameters: [queryParam('competition', S.id, 'Competition id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Athletes with scores', { type: 'array', items: {} }) },
+  });
+
+  sa('/api/superadmin/scores/team-rankings', 'get', {
+    operationId: 'superAdminTeamRankings', summary: 'Team rankings',
+    parameters: [queryParam('competition', S.id, 'Competition id'), ...CATEGORY_QUERY],
+    responses: { 200: ok('Rankings', { type: 'array', items: {} }) },
+  });
+
+  sa('/api/superadmin/scores/save', 'post', {
+    operationId: 'superAdminSaveScores', summary: 'Write a slip or a score sheet',
+    requestBody: jsonBody(ref('SaveScoreRequest')),
+    responses: { 200: ok('Saved', ref('Score')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/scores/recalculate', 'post', {
+    operationId: 'superAdminRecalculateScores', summary: 'Recompute an age group',
+    requestBody: jsonBody(inline({ competitionId: S.id, ageGroup: S.ageGroup })),
+    responses: { 200: ok('Recalculated'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/scores/{scoreId}/lock', 'put', {
+    operationId: 'superAdminLockScore', summary: 'Lock a score sheet',
+    parameters: [pathParam('scoreId', 'Score document id')],
+    responses: { 200: ok('Locked'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/scores/{scoreId}/unlock', 'put', {
+    operationId: 'superAdminUnlockScore', summary: 'Unlock a score sheet',
+    parameters: [pathParam('scoreId', 'Score document id')],
+    responses: { 200: ok('Unlocked'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/scores/{scoreId}/players/{playerId}/unlock', 'put', {
+    operationId: 'superAdminUnlockPlayerForJudges', summary: 'Reopen one athlete for the judges',
+    parameters: [pathParam('scoreId', 'Score document id'), pathParam('playerId', 'Athlete id')],
+    requestBody: jsonBody(inline({ apparatus: { type: 'string' } }, [])),
+    responses: { 200: ok('Reopened'), ...NOT_FOUND },
+  });
+
+  sa('/api/superadmin/age-groups/start', 'post', {
+    operationId: 'superAdminStartAgeGroup', summary: 'Open a category for scoring',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody })),
+    responses: { 200: ok('Started'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/competition/age-group/start', 'post', {
+    operationId: 'superAdminStartAgeGroupAlias', summary: 'Open a category for scoring (alias)',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody })),
+    responses: { 200: ok('Started'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/lots', 'get', {
+    tag: 'Running order', operationId: 'superAdminGetLots', summary: 'Running order',
+    parameters: [
+      queryParam('competitionId', S.id, 'Competition id', true),
+      queryParam('gender', S.gender, 'Category gender', true),
+      queryParam('ageGroup', S.ageGroup, 'Category age group', true),
+      queryParam('competitionType', S.competitionType, 'Competition type', true),
+    ],
+    responses: { 200: ok('Running order', ref('RunningOrder')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/lots/draw', 'post', {
+    tag: 'Running order', operationId: 'superAdminDrawLots', summary: 'Draw lots',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody, includePlayers: S.bool })),
+    responses: { 200: ok('Drawn', ref('RunningOrder')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/lots/teams', 'put', {
+    tag: 'Running order', operationId: 'superAdminSetTeamOrder', summary: 'Set the team order',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody, teamIds: { type: 'array', items: S.id } })),
+    responses: { 200: ok('Order set', ref('RunningOrder')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/lots/players', 'put', {
+    tag: 'Running order', operationId: 'superAdminSetPlayerOrder', summary: 'Set one team\'s athlete order',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody, teamId: S.id, playerIds: { type: 'array', items: S.id } })),
+    responses: { 200: ok('Order set', ref('RunningOrder')), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/tie-break/draws', 'post', {
+    tag: 'Scores', operationId: 'superAdminRecordTieBreakDraw', summary: 'Record the lucky draw for one tied group',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody, apparatus: { type: 'string', enum: APPARATUS }, order: { type: 'array', items: S.id, minItems: 2, maxItems: 100 } })),
+    responses: { 200: ok('Recorded'), ...VALIDATION_ERROR },
+  });
+
+  sa('/api/superadmin/tie-break/draws', 'delete', {
+    tag: 'Scores', operationId: 'superAdminClearTieBreakDraw', summary: 'Remove a recorded lucky draw',
+    requestBody: jsonBody(inline({ competitionId: S.id, ...categoryBody, apparatus: { type: 'string', enum: APPARATUS }, groupKey: { type: 'string' } })),
+    responses: { 200: ok('Cleared'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  // ===================== Walk-in desk =====================
+  // Admin / Super Admin register a coach, team and no-email players from a
+  // photographed paper form (services/walk-in). Admins only for their meets.
+
+  const desk = (path, method, config) => add(path, method, op({
+    tag: 'Walk-in desk', roles: 'admin, superadmin', ...config,
+  }));
+  const draftParam = [pathParam('draftId', 'Walk-in draft')];
+  const draftRow = inline({
+    _id: S.id, firstName: S.str, lastName: S.str,
+    dateOfBirth: { type: 'string', description: 'YYYY-MM-DD' },
+    gender: S.gender, ageGroup: S.ageGroup,
+    apparatus: { type: 'array', items: S.apparatus },
+    confirmDuplicate: S.bool,
+  });
+
+  desk('/api/desk/meets', 'get', {
+    operationId: 'deskOpenMeets', summary: 'Meets whose fee window is open now',
+    responses: { 200: ok('Meets') },
+  });
+  desk('/api/desk/ocr/status', 'get', {
+    operationId: 'deskOcrStatus', summary: 'Is the form reader configured and answering?',
+    responses: { 200: ok('Status', inline({ enabled: S.bool, healthy: S.bool })) },
+  });
+  desk('/api/desk/coaches', 'get', {
+    operationId: 'deskFindCoach', summary: 'Find returning coaches by name, email, phone or team name',
+    description: '`q` (2+ characters) returns `{ coaches: [...] }`, up to 10; `email` alone is the exact lookup and returns `{ coach }`.',
+    parameters: [queryParam('q', S.str, 'Name, email, phone or team name'), queryParam('email', S.email, 'Exact coach email (when q is absent)')],
+    responses: { 200: ok('The coach, or null'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/coaches', 'post', {
+    operationId: 'deskCreateCoach', summary: 'Create a coach account at the desk',
+    description: 'The coach types their own password and their default player password.',
+    requestBody: jsonBody(inline({ firstName: S.str, lastName: S.str, email: S.email, phone: S.str, password: S.str, playerDefaultPassword: S.str },
+      ['firstName', 'lastName', 'email', 'phone', 'password', 'playerDefaultPassword'])),
+    responses: { 201: ok('Created'), ...VALIDATION_ERROR, 409: errorResponse('Email already registered') },
+  });
+  desk('/api/desk/coaches/{coachId}/player-default-password', 'put', {
+    operationId: 'deskSetCoachDefaultPassword', summary: 'Set a returning coach’s default player password',
+    parameters: [pathParam('coachId', 'Coach')],
+    requestBody: jsonBody(inline({ playerDefaultPassword: S.str, phone: S.str }, ['playerDefaultPassword'])),
+    responses: { 200: ok('Saved'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+  desk('/api/desk/coaches/{coachId}/team', 'post', {
+    operationId: 'deskEnsureTeam', summary: 'Create the coach’s team unless they have one',
+    parameters: [pathParam('coachId', 'Coach')],
+    requestBody: jsonBody(inline({ name: S.str, description: S.str }, ['name'])),
+    responses: { 200: ok('Existing team'), 201: ok('Created'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+  desk('/api/desk/form', 'get', {
+    operationId: 'deskFormPdf', summary: 'The printable walk-in form (A4 PDF) — one form for every competition',
+    responses: { 200: { description: 'PDF', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } }, ...NOT_FOUND },
+  });
+  desk('/api/desk/drafts', 'get', {
+    operationId: 'deskListDrafts', summary: 'Unfinished walk-in forms at a meet',
+    parameters: [queryParam('competitionId', S.id, 'Competition', true)],
+    responses: { 200: ok('Drafts'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts', 'post', {
+    operationId: 'deskOpenDraft', summary: 'Enter the coach’s team in the meet and open (or resume) a form',
+    requestBody: jsonBody(inline({ competitionId: S.id, coachId: S.id }, ['competitionId', 'coachId'])),
+    responses: { 201: ok('Draft'), ...VALIDATION_ERROR, 409: errorResponse('Team already submitted'), 422: errorResponse('Meet not taking entries') },
+  });
+  desk('/api/desk/drafts/{draftId}', 'get', {
+    operationId: 'deskGetDraft', summary: 'A form with each row’s age, eligible groups and issues',
+    parameters: draftParam, responses: { 200: ok('Draft'), ...NOT_FOUND },
+  });
+  desk('/api/desk/drafts/{draftId}', 'delete', {
+    operationId: 'deskCancelDraft', summary: 'Discard a form nobody was registered from',
+    parameters: draftParam, responses: { 200: ok('Cancelled'), ...NOT_FOUND, 422: errorResponse('Players already registered') },
+  });
+  desk('/api/desk/drafts/{draftId}/scan', 'post', {
+    operationId: 'deskScanPage', summary: 'Read one photographed page into the form',
+    description: 'Body is the image itself (JPEG, PNG or WebP, at most 8 MB). Answers 503 `OCR_BUSY` / `OCR_UNAVAILABLE` when the reader cannot take it.',
+    parameters: [...draftParam, queryParam('page', S.int, 'Page number, used only if the QR code is unreadable')],
+    requestBody: { required: true, content: { 'image/jpeg': { schema: { type: 'string', format: 'binary' } } } },
+    responses: { 200: ok('Rows read, with row crops'), ...VALIDATION_ERROR, 422: errorResponse('Unreadable photo or wrong form'), 503: errorResponse('Reader busy or unavailable') },
+  });
+  desk('/api/desk/drafts/{draftId}/rows', 'put', {
+    operationId: 'deskSaveRows', summary: 'Save the review grid',
+    parameters: draftParam,
+    requestBody: jsonBody(inline({ rows: { type: 'array', items: draftRow, maxItems: 120 }, guardianConsent: S.bool }, ['rows'])),
+    responses: { 200: ok('Draft'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts/{draftId}/submit', 'post', {
+    operationId: 'deskSubmit', summary: 'Create and enter every player (resumable)',
+    parameters: draftParam,
+    responses: { 200: ok('Draft'), 409: errorResponse('Submit already running'), 422: errorResponse('Rows still invalid') },
+  });
+  desk('/api/desk/drafts/{draftId}/payment/order', 'post', {
+    operationId: 'deskPaymentOrder', summary: 'Razorpay order for the coach’s entry',
+    parameters: draftParam, responses: { 200: ok('Order'), 422: errorResponse('Not submitted yet') },
+  });
+  desk('/api/desk/drafts/{draftId}/payment/verify', 'post', {
+    operationId: 'deskPaymentVerify', summary: 'Verify the checkout and submit the team',
+    parameters: draftParam,
+    requestBody: jsonBody(inline({ razorpay_order_id: S.str, razorpay_payment_id: S.str, razorpay_signature: S.str }, ['razorpay_order_id', 'razorpay_payment_id', 'razorpay_signature'])),
+    responses: { 200: ok('Paid'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts/{draftId}/payment/resubmit', 'post', {
+    operationId: 'deskResubmitPaid', summary: 'Submit a reopened team whose players are all paid for (nothing to charge)',
+    parameters: draftParam, responses: { 200: ok('Submitted'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts/{draftId}/payment/discount/quote', 'post', {
+    operationId: 'deskDiscountQuote', summary: 'Price the entry with the discount code',
+    parameters: draftParam, requestBody: jsonBody(inline({ discountCode: S.str }, ['discountCode'])),
+    responses: { 200: ok('Quote'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts/{draftId}/payment/discount', 'post', {
+    operationId: 'deskDiscountRedeem', summary: 'Submit the entry with the discount code',
+    parameters: draftParam, requestBody: jsonBody(inline({ discountCode: S.str }, ['discountCode'])),
+    responses: { 200: ok('Submitted'), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts/{draftId}/slip', 'get', {
+    operationId: 'deskSlip', summary: 'The slip to hand the coach: Player IDs and payment',
+    parameters: draftParam, responses: { 200: ok('Slip'), ...NOT_FOUND },
+  });
+
+  // Desk v2 (docs/walk-in-desk-v2-plan.md): unlock, Excel, default password.
+  const coachIdParam = [pathParam('coachId', 'Coach')];
+  const xlsx = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const xlsxBody = { required: true, content: { [xlsx]: { schema: { type: 'string', format: 'binary' } } } };
+  const excelErrors = { type: 'array', items: inline({ excelRow: S.int, field: S.str, message: S.str }) };
+  desk('/api/desk/coaches/{coachId}/player-default-password', 'get', {
+    operationId: 'deskGetCoachDefaultPassword', summary: 'The coach’s default player password, for the coach to read at the desk',
+    description: 'Decrypted (it is stored encrypted, not hashed). `readable: false` means the key was rotated and the coach must set it again. Audited.',
+    parameters: coachIdParam,
+    responses: { 200: ok('Password', inline({ isSet: S.bool, readable: S.bool, password: S.str, setAt: { type: 'string', format: 'date-time' } })), ...NOT_FOUND },
+  });
+  desk('/api/desk/teams/status', 'get', {
+    operationId: 'deskTeamStatus', summary: 'Is the coach’s team entered / submitted / paid at this meet?',
+    parameters: [queryParam('competitionId', S.id, 'Competition', true), queryParam('coachId', S.id, 'Coach', true)],
+    responses: {
+      200: ok('Status', inline({
+        registered: S.bool, isSubmitted: S.bool, reopened: S.bool, paymentStatus: S.str, paymentAmount: S.num,
+        players: S.int, paidPlayers: S.int,
+        feeWindow: inline({ canPay: S.bool, isLate: S.bool, lateFeePerPlayer: S.num }),
+        squad: { type: 'array', items: inline({ _id: S.id, name: S.str, loginId: S.str, gender: S.gender, ageGroup: S.ageGroup, paid: S.bool }) },
+      })),
+      ...VALIDATION_ERROR,
+    },
+  });
+  desk('/api/desk/teams/unlock', 'post', {
+    operationId: 'deskUnlockTeam', summary: 'Unlock a submitted team so players can be added',
+    description: 'Admins on their assigned meets, the Super Admin on any. A paid squad is written into `paidEntries` first, so only players added after this are charged (plus the per-player late fee). Recorded in History as `ENTRY_REOPENED` (`via: walk-in-desk`).',
+    requestBody: jsonBody(inline({ competitionId: S.id, coachId: S.id, reason: { type: 'string', minLength: 5, maxLength: 300 } }, ['competitionId', 'coachId', 'reason'])),
+    responses: {
+      200: ok('Unlocked', inline({ paidPlayers: S.int, paidAmount: S.num, status: { type: 'object' } })),
+      ...VALIDATION_ERROR, ...NOT_FOUND, 409: errorResponse('Team already open'), 422: errorResponse('Meet not taking entries'),
+    },
+  });
+  desk('/api/desk/excel-template', 'get', {
+    operationId: 'deskExcelTemplate', summary: 'The walk-in Excel template (.xlsx): Coach, Players and Read me sheets',
+    responses: { 200: { description: 'Workbook', content: { [xlsx]: { schema: { type: 'string', format: 'binary' } } } } },
+  });
+  desk('/api/desk/excel/parse', 'post', {
+    operationId: 'deskParseExcel', summary: 'Read a filled template without saving anything',
+    description: 'Body is the .xlsx itself (at most 1 MB, 200 players). Returns the Coach sheet, the player rows and an error per bad cell; `existingCoach` is the account with the sheet’s email, if any.',
+    requestBody: xlsxBody,
+    responses: { 200: ok('Parsed', inline({ coach: { type: 'object' }, rows: { type: 'array', items: draftRow }, errors: excelErrors, existingCoach: { type: 'object', nullable: true } })), ...VALIDATION_ERROR },
+  });
+  desk('/api/desk/drafts/{draftId}/excel', 'post', {
+    operationId: 'deskImportExcel', summary: 'Add a filled template’s players to the form for review',
+    description: 'Rows get `source: excel` and `excelRow`. A row already on the form (same name and date of birth) is skipped, so uploading the same file twice adds nobody twice. Nothing is registered until submit.',
+    parameters: [...draftParam, queryParam('fileName', S.str, 'Original file name, for the record')],
+    requestBody: xlsxBody,
+    responses: { 200: ok('Draft', inline({ draft: { type: 'object' }, added: S.int, skipped: S.int, errors: excelErrors })), ...VALIDATION_ERROR, ...NOT_FOUND },
+  });
+
+  // ===================== Qualification finals (Competition II / III) =====================
+  const finalIdParam = [pathParam('finalId', 'Final (one Competition II / III category)')];
+  const finalsFor = (prefix, tag, roles, competitionContext) => {
+    const meetQuery = competitionContext ? [] : [queryParam('competitionId', S.id, 'Competition', true)];
+    const f = (path, method, config) => add(`${prefix}${path}`, method, op({ tag, roles, competitionContext, ...config, parameters: [...meetQuery, ...(config.parameters || [])] }));
+    const id = prefix.replace(/\W/g, '');
+    f('/finals', 'get', { operationId: `${id}ListFinals`, summary: 'Every final with its qualifiers and state', responses: { 200: ok('Finals') } });
+    f('/finals/recompute', 'post', { operationId: `${id}RecomputeFinals`, summary: 'Recompute qualifiers from published Competition I scores (unfinalized finals only)', responses: { 200: ok('Finals'), 423: errorResponse('Competition locked') } });
+    f('/finals/finalize-all', 'post', { operationId: `${id}FinalizeAllFinals`, summary: 'Finalize every final that is ready: enter the qualifiers', responses: { 200: ok('Finals'), 423: errorResponse('Competition locked') } });
+    f('/finals/{finalId}/finalize', 'post', { operationId: `${id}FinalizeFinal`, summary: 'Finalize one final', parameters: finalIdParam, responses: { 200: ok('Final'), ...NOT_FOUND, 422: errorResponse('Ties unresolved') } });
+    f('/finals/{finalId}/withdraw', 'post', {
+      operationId: `${id}WithdrawFinalist`, summary: 'Withdraw a qualifier (the next one moves up)', parameters: finalIdParam,
+      requestBody: jsonBody(inline({ playerId: S.id, reason: S.str }, ['playerId'])), responses: { 200: ok('Final'), ...VALIDATION_ERROR, ...NOT_FOUND },
+    });
+    f('/finals/{finalId}/reinstate', 'post', {
+      operationId: `${id}ReinstateFinalist`, summary: 'Reinstate a withdrawn qualifier', parameters: finalIdParam,
+      requestBody: jsonBody(inline({ playerId: S.id }, ['playerId'])), responses: { 200: ok('Final'), ...VALIDATION_ERROR, ...NOT_FOUND },
+    });
+    f('/finals/{finalId}/draw', 'post', {
+      operationId: `${id}DrawFinal`, summary: 'Record the physical lucky draw that breaks a tie at the cut-off', parameters: finalIdParam,
+      requestBody: jsonBody(inline({ ageGroup: S.ageGroup, order: { type: 'array', items: S.id, minItems: 2, maxItems: 20 } }, ['order'])),
+      responses: { 200: ok('Final'), ...VALIDATION_ERROR, ...NOT_FOUND },
+    });
+  };
+  finalsFor('/api/admin', 'Admin', 'admin (own meet), superadmin', true);
+  finalsFor('/api/superadmin', 'Super admin', 'superadmin', false);
+  add('/api/superadmin/finals/{finalId}/reopen', 'post', op({
+    tag: 'Super admin', roles: 'superadmin', operationId: 'superadminReopenFinal', summary: 'Reopen a finalized final (Super Admin only)',
+    parameters: [queryParam('competitionId', S.id, 'Competition', true), ...finalIdParam], responses: { 200: ok('Final'), ...NOT_FOUND },
+  }));
+  add('/api/coaches/finals', 'get', op({
+    tag: 'Coaches', roles: 'coach', competitionContext: true, operationId: 'coachFinals',
+    summary: 'The coach’s players who qualified for Competition II / III', responses: { 200: ok('Finals') },
+  }));
+  add('/api/players/finals', 'get', op({
+    tag: 'Players', roles: 'player', operationId: 'playerFinals',
+    summary: 'The player’s own qualification for Competition II / III', responses: { 200: ok('Finals') },
+  }));
+  add('/api/public/finals', 'get', op({
+    tag: 'Public', auth: false, operationId: 'publicFinals', summary: 'Who qualified for each Competition II / III final',
+    parameters: [queryParam('competitionId', S.id, 'Competition', true)], responses: { 200: ok('Finals'), ...VALIDATION_ERROR },
+  }));
+
+  // ===================== Coach: co-coaches, paper form; player: team at a level =====================
+  add('/api/coaches/co-coaches', 'get', op({
+    tag: 'Coaches', roles: 'coach', operationId: 'coachListCoCoaches', summary: 'The team’s main coach and co-coaches',
+    responses: { 200: ok('Coaches') },
+  }));
+  add('/api/coaches/co-coaches/{coachId}/remove', 'post', op({
+    tag: 'Coaches', roles: 'coach (main coach)', operationId: 'coachRemoveCoCoach', summary: 'Remove a co-coach from the team',
+    parameters: coachIdParam, responses: { 200: ok('Removed'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+  const paper = (path, method, config) => add(`/api/coaches/paper-form${path}`, method, op({
+    tag: 'Coaches', roles: 'coach', competitionContext: path.startsWith('/draft'),
+    description: 'A coach’s own paper form: the walk-in desk flow on their own team, behind the COACH_PAPER_FORM_ENABLED flag (404 when off). Pays from the dashboard, not here.',
+    ...config,
+  }));
+  paper('/form', 'get', { operationId: 'paperFormPdf', summary: 'The printable form (A4 PDF)', responses: { 200: { description: 'PDF', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } } } });
+  paper('/ocr/status', 'get', { operationId: 'paperFormOcrStatus', summary: 'Is the form reader answering?', responses: { 200: ok('Status', inline({ enabled: S.bool, healthy: S.bool })) } });
+  paper('/draft', 'get', { operationId: 'paperFormCurrent', summary: 'The coach’s unfinished form at this meet, and whether the squad is submitted', responses: { 200: ok('Form', inline({ draft: { type: 'object', nullable: true }, squadSubmitted: S.bool })) } });
+  paper('/draft', 'post', { operationId: 'paperFormOpen', summary: 'Open (or resume) the coach’s form', responses: { 201: ok('Draft'), 409: errorResponse('Squad already submitted') } });
+  paper('/draft/{draftId}', 'get', { operationId: 'paperFormGet', summary: 'The form with each row’s checks', parameters: draftParam, responses: { 200: ok('Draft'), ...NOT_FOUND } });
+  paper('/draft/{draftId}', 'delete', { operationId: 'paperFormCancel', summary: 'Discard the form', parameters: draftParam, responses: { 200: ok('Cancelled'), ...NOT_FOUND } });
+  paper('/draft/{draftId}/scan', 'post', {
+    operationId: 'paperFormScan', summary: 'Read one photographed page', parameters: [...draftParam, queryParam('page', S.int, 'Page number if the QR is unreadable')],
+    requestBody: { required: true, content: { 'image/jpeg': { schema: { type: 'string', format: 'binary' } } } },
+    responses: { 200: ok('Rows read'), ...VALIDATION_ERROR, 503: errorResponse('Reader busy or unavailable') },
+  });
+  paper('/draft/{draftId}/rows', 'put', {
+    operationId: 'paperFormSaveRows', summary: 'Save the review grid', parameters: draftParam,
+    requestBody: jsonBody(inline({ rows: { type: 'array', items: draftRow, maxItems: 120 }, guardianConsent: S.bool }, ['rows'])), responses: { 200: ok('Draft'), ...VALIDATION_ERROR },
+  });
+  paper('/draft/{draftId}/submit', 'post', { operationId: 'paperFormSubmit', summary: 'Register and enter every player', parameters: draftParam, responses: { 200: ok('Draft'), 422: errorResponse('Rows still invalid') } });
+  paper('/draft/{draftId}/slip', 'get', { operationId: 'paperFormSlip', summary: 'Player IDs for the registered players', parameters: draftParam, responses: { 200: ok('Slip'), ...NOT_FOUND } });
+  add('/api/players/team/level', 'get', op({
+    tag: 'Players', roles: 'player', operationId: 'playerTeamAtLevel', summary: 'The player’s team at one competition level (final per level)',
+    parameters: [queryParam('level', { type: 'string', enum: [...COMPETITION_LEVELS] }, 'Competition level', true)], responses: { 200: ok('Team or null'), ...VALIDATION_ERROR },
+  }));
+
+  // ===================== Restore judges' edit allowance =====================
+  const restoreEdits = (prefix, tag, roles) => add(`${prefix}/scores/{scoreId}/players/{playerId}/restore-edits`, 'put', op({
+    tag, roles, operationId: `${prefix.replace(/\W/g, '')}RestoreSlipEdits`,
+    summary: 'Give the judges their Edit My Score allowance (3) back on one athlete. No mark changes.',
+    parameters: [pathParam('scoreId', 'Score sheet'), pathParam('playerId', 'Player')],
+    requestBody: jsonBody(inline({ apparatus: S.apparatus, judgeType: S.judgeType }, ['apparatus'])),
+    responses: { 200: ok('Restored'), ...VALIDATION_ERROR, ...NOT_FOUND },
+  }));
+  restoreEdits('/api/admin', 'Scores', 'admin (own meet), superadmin');
+  restoreEdits('/api/superadmin', 'Super admin', 'superadmin');
+  add('/api/judge/scores/{scoreId}/players/{playerId}/restore-edits', 'put', op({
+    tag: 'Judge', roles: 'judge (Senior Judge of this panel)', operationId: 'judgeRestoreSlipEdits',
+    summary: 'Senior Judge gives one seat (their own included) its Edit My Score allowance (3) back on one athlete, once used up.',
+    parameters: [pathParam('scoreId', 'Score sheet'), pathParam('playerId', 'Player')],
+    requestBody: jsonBody(inline({ apparatus: S.apparatus, judgeType: S.judgeType }, ['apparatus', 'judgeType'])),
+    responses: {
+      200: ok('Restored'), ...VALIDATION_ERROR, ...NOT_FOUND,
+      403: errorResponse('Not the Senior Judge of this panel'),
+      409: errorResponse('Edits still left, or the athlete is already final / locked'),
+    },
+  }));
+
+  // ===================== Super Admin: History, Fix, Accounts, Player teams =====================
+  // Every write takes `reason` (5+ characters) and is recorded in History.
+  const saOp = (path, method, config) => add(`/api/superadmin${path}`, method, op({ tag: 'Super admin', roles: 'superadmin', ...config }));
+  const REASON = { type: 'string', minLength: 5, maxLength: 500, description: 'Why — recorded in History' };
+  const withReason = (properties = {}, required = []) => jsonBody(inline({ ...properties, reason: REASON }, [...required, 'reason']));
+  const why = { ...VALIDATION_ERROR, ...NOT_FOUND };
+
+  saOp('/history', 'get', {
+    operationId: 'saHistory', summary: 'Everything on record, newest first (corrections and audited actions)',
+    parameters: [queryParam('entity', S.str, 'Entity type'), queryParam('competitionId', S.id, 'Competition'), queryParam('entityId', S.str, 'Entity id'), queryParam('q', S.str, 'Search text'), queryParam('correctionsOnly', S.bool, 'Only Super Admin corrections'), ...PAGINATION_QUERY],
+    responses: { 200: ok('Page of records') },
+  });
+  saOp('/history/{logId}/undo', 'post', { operationId: 'saUndo', summary: 'Undo a plain field edit (replayed through the same service)', parameters: [pathParam('logId', 'History record')], requestBody: withReason(), responses: { 200: ok('Undone'), ...why, 422: errorResponse('Not undoable') } });
+  saOp('/competitions-deleted', 'get', { operationId: 'saDeletedCompetitions', summary: 'Deleted competitions that can be restored', responses: { 200: ok('Competitions') } });
+  saOp('/competitions/{id}/restore', 'post', { operationId: 'saRestoreCompetition', summary: 'Restore a deleted competition', parameters: [pathParam('id', 'Competition')], requestBody: withReason(), responses: { 200: ok('Competition'), ...why } });
+
+  const accountParams = [{ name: 'type', in: 'path', required: true, schema: { type: 'string', enum: ['player', 'coach', 'judge', 'admin'] } }, pathParam('accountId', 'Account')];
+  saOp('/accounts', 'get', { operationId: 'saSearchAccounts', summary: 'Find accounts of any role', parameters: [queryParam('q', S.str, 'Name, email or Player ID'), queryParam('type', { type: 'string', enum: ['player', 'coach', 'judge', 'admin'] }, 'Role')], responses: { 200: ok('Accounts') } });
+  saOp('/accounts/{type}/{accountId}', 'get', { operationId: 'saGetAccount', summary: 'One account in full', parameters: accountParams, responses: { 200: ok('Account'), ...why } });
+  saOp('/accounts/{type}/{accountId}', 'put', { operationId: 'saUpdateAccount', summary: 'Correct an account’s fields (name, email, phone, DOB, gender…)', parameters: accountParams, requestBody: withReason({}, []), responses: { 200: ok('Saved'), ...why, 409: errorResponse('Email or Player ID taken') } });
+  saOp('/accounts/{type}/{accountId}/reset-password', 'post', { operationId: 'saResetPassword', summary: 'Set a temporary password (returned once)', parameters: accountParams, requestBody: withReason(), responses: { 200: ok('Temporary password'), ...why } });
+  saOp('/accounts/{type}/{accountId}/sign-out', 'post', { operationId: 'saSignOutEverywhere', summary: 'End every session of the account', parameters: accountParams, requestBody: withReason(), responses: { 200: ok('Signed out'), ...why } });
+  saOp('/accounts/{type}/{accountId}/active', 'post', { operationId: 'saSetActive', summary: 'Activate or deactivate an account (coaches cannot be deactivated)', parameters: accountParams, requestBody: withReason({ isActive: S.bool }, ['isActive']), responses: { 200: ok('Saved'), ...why } });
+
+  const teamParam = [pathParam('teamId', 'Team')];
+  saOp('/fix/teams', 'get', { operationId: 'saSearchTeams', summary: 'Find teams by name or coach', parameters: [queryParam('q', S.str, 'Team or coach name / email'), queryParam('includeDeleted', S.bool, 'Include deleted teams (default true)')], responses: { 200: ok('Teams') } });
+  saOp('/fix/teams/{teamId}', 'get', { operationId: 'saTeamDetail', summary: 'A team with its coaches, players and entries', parameters: teamParam, responses: { 200: ok('Team'), ...why } });
+  saOp('/fix/teams/{teamId}', 'put', { operationId: 'saRenameTeam', summary: 'Rename a team', parameters: teamParam, requestBody: withReason({ name: S.str }, ['name']), responses: { 200: ok('Team'), ...why } });
+  saOp('/fix/teams/{teamId}/delete', 'post', { operationId: 'saDeleteTeam', summary: 'Delete (hide) a team', parameters: teamParam, requestBody: withReason(), responses: { 200: ok('Team'), ...why } });
+  saOp('/fix/teams/{teamId}/restore', 'post', { operationId: 'saRestoreTeam', summary: 'Restore a deleted team', parameters: teamParam, requestBody: withReason(), responses: { 200: ok('Team'), ...why } });
+  saOp('/fix/teams/{teamId}/change-coach', 'post', { operationId: 'saChangeCoach', summary: 'Give the team a new main coach', parameters: teamParam, requestBody: withReason({ coachId: S.id, oldCoach: { type: 'string', enum: ['cocoach', 'remove'] } }, ['coachId']), responses: { 200: ok('Team'), ...why } });
+  saOp('/fix/teams/{teamId}/co-coaches/{coachId}/remove', 'post', { operationId: 'saRemoveCoCoach', summary: 'Remove a co-coach', parameters: [...teamParam, ...coachIdParam], requestBody: withReason(), responses: { 200: ok('Team'), ...why } });
+  const transferQuery = { playerId: S.id, toTeamId: S.id, level: { type: 'string', enum: [...COMPETITION_LEVELS] } };
+  saOp('/fix/transfer/preview', 'get', { operationId: 'saTransferPreview', summary: 'What moving a player to another team at a level would change', parameters: Object.entries(transferQuery).map(([k, s]) => queryParam(k, s, k, true)), responses: { 200: ok('Preview'), ...why } });
+  saOp('/fix/transfer', 'post', { operationId: 'saTransfer', summary: 'Move a player to another team at a level (and their entries)', requestBody: withReason({ ...transferQuery, competitionIds: { type: 'array', items: S.id }, overrideLimit: S.bool }, ['playerId', 'toTeamId', 'level']), responses: { 200: ok('Moved'), ...why, 422: errorResponse('Squad full or meet locked') } });
+
+  saOp('/fix/scores', 'get', { operationId: 'saListScores', summary: 'Score sheets to correct', parameters: [queryParam('competitionId', S.id, 'Competition', true), ...CATEGORY_QUERY, queryParam('teamId', S.id, 'Team')], responses: { 200: ok('Score sheets') } });
+  saOp('/fix/scores/{scoreId}/rows/{rowId}', 'post', {
+    operationId: 'saCorrectScore', summary: 'Correct one athlete’s marks, time or deductions (totals recomputed)',
+    parameters: [pathParam('scoreId', 'Score sheet'), pathParam('rowId', 'Athlete row')],
+    requestBody: withReason({ slips: { type: 'array', items: inline({ judgeRole: S.str, difficultyScore: S.num, combinationScore: S.num, executionScore: S.num, bonusScore: S.num }) }, judgeScores: { type: 'object' }, time: S.num, deduction: S.num, otherDeduction: S.num }),
+    responses: { 200: ok('Score'), ...why },
+  });
+  saOp('/fix/scores/{scoreId}/players/{playerId}/unlock', 'post', { operationId: 'saUnlockForJudges', summary: 'Unlock one athlete for the judges (clears Final Submit)', parameters: [pathParam('scoreId', 'Score sheet'), pathParam('playerId', 'Player')], requestBody: withReason({ apparatus: S.apparatus }), responses: { 200: ok('Unlocked'), ...why } });
+
+  const entryParams = [pathParam('competitionId', 'Competition'), ...teamParam];
+  const playerParam = [pathParam('playerId', 'Player')];
+  const entryFields = { gender: S.gender, ageGroup: S.ageGroup, apparatus: { type: 'array', items: S.apparatus }, overrideAge: S.bool, overrideLimit: S.bool };
+  saOp('/fix/entries/{competitionId}', 'get', { operationId: 'saEntryTeams', summary: 'Teams entered in a meet', parameters: [pathParam('competitionId', 'Competition')], responses: { 200: ok('Teams'), ...why } });
+  saOp('/fix/entries/{competitionId}/{teamId}', 'get', { operationId: 'saEntry', summary: 'One team’s entry: players, payment, paid entries', parameters: entryParams, responses: { 200: ok('Entry'), ...why } });
+  saOp('/fix/entries/{competitionId}/{teamId}/players', 'post', { operationId: 'saEntryAddPlayer', summary: 'Add an athlete to the squad (COP age rule and squad size apply unless overridden)', parameters: entryParams, requestBody: withReason({ playerId: S.id, ...entryFields }, ['playerId', 'gender', 'ageGroup']), responses: { 200: ok('Entry'), ...why, 422: errorResponse('Squad full or age rule') } });
+  saOp('/fix/entries/{competitionId}/{teamId}/players/{playerId}', 'put', { operationId: 'saEntryUpdatePlayer', summary: 'Change an athlete’s age group, gender or apparatus', parameters: [...entryParams, ...playerParam], requestBody: withReason(entryFields), responses: { 200: ok('Entry'), ...why } });
+  saOp('/fix/entries/{competitionId}/{teamId}/players/{playerId}/remove', 'post', { operationId: 'saEntryRemovePlayer', summary: 'Remove an athlete from the squad (a paid entry is not refunded)', parameters: [...entryParams, ...playerParam], requestBody: withReason(), responses: { 200: ok('Entry'), ...why } });
+  saOp('/fix/entries/{competitionId}/{teamId}/status', 'post', { operationId: 'saEntryStatus', summary: 'Correct submitted / payment status (unsubmitting a paid team records its players as paid)', parameters: entryParams, requestBody: withReason({ isSubmitted: S.bool, paymentStatus: { type: 'string', enum: ['pending', 'completed', 'failed'] } }), responses: { 200: ok('Entry'), ...why } });
+  saOp('/fix/entries/{competitionId}/{teamId}/money', 'post', { operationId: 'saEntryMoney', summary: 'Record money that moved outside the app (cash, bank, refund)', parameters: entryParams, requestBody: withReason({ kind: { type: 'string', enum: ['payment', 'refund'] }, amount: S.num, method: S.str, note: S.str }, ['kind', 'amount']), responses: { 200: ok('Ledger line'), ...why } });
+
+  const ptLevel = { type: 'string', enum: [...COMPETITION_LEVELS] };
+  saOp('/player-teams/players', 'get', { operationId: 'saPlayerTeamsSearch', summary: 'Find players and their team at each level', parameters: [queryParam('q', S.str, 'Name or Player ID')], responses: { 200: ok('Players') } });
+  saOp('/player-teams/players/{playerId}', 'get', { operationId: 'saPlayerTeamsDetail', summary: 'A player’s team per level and their entries', parameters: playerParam, responses: { 200: ok('Player'), ...why } });
+  saOp('/player-teams/players/{playerId}/correct', 'post', { operationId: 'saPlayerTeamsCorrect', summary: 'Correct a player’s team at a level', parameters: playerParam, requestBody: withReason({ level: ptLevel, teamId: S.id }, ['level', 'teamId']), responses: { 200: ok('Player'), ...why } });
+  saOp('/player-teams/players/{playerId}/remove-entries', 'post', { operationId: 'saPlayerTeamsRemoveEntries', summary: 'Remove a player’s entries at a level', parameters: playerParam, requestBody: jsonBody(inline({ level: ptLevel }, ['level'])), responses: { 200: ok('Player'), ...why } });
+  saOp('/player-teams/conflicts', 'get', { operationId: 'saPlayerTeamsConflicts', summary: 'Players entered for two teams at one level (from before the rule)', responses: { 200: ok('Conflicts') } });
+  saOp('/player-teams/conflicts/{conflictId}/resolve', 'post', { operationId: 'saPlayerTeamsResolve', summary: 'Resolve a conflict by choosing the team', parameters: [pathParam('conflictId', 'Conflict')], requestBody: jsonBody(inline({ teamId: S.id }, ['teamId'])), responses: { 200: ok('Resolved'), ...why } });
+  saOp('/player-teams/history', 'get', { operationId: 'saPlayerTeamsHistory', summary: 'Changes to players’ teams per level', parameters: [queryParam('level', ptLevel, 'Level'), queryParam('teamId', S.id, 'Team'), queryParam('playerId', S.id, 'Player'), queryParam('page', S.int, 'Page')], responses: { 200: ok('Page of changes') } });
+
+  return paths;
+}
+/* eslint-enable max-lines-per-function */
+
+// ---------------------------------------------------------------------------
+// Document
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {Object} [options]
+ * @param {string} [options.serverUrl] - the deployment to point "Try it out" at
+ * @returns {Object} an OpenAPI 3.0.3 document
+ */
+function buildOpenApiDocument({ serverUrl = 'http://localhost:5000' } = {}) {
+  return {
+    openapi: '3.0.3',
+    info: {
+      title: 'Mallakhamb Competition API',
+      version: '1.0.0',
+      description: [
+        'Competition management for Mallakhamb India: registration, squad entry,',
+        'payment, panel seating, live judging and results.',
+        '',
+        '### Versioning',
+        'Every path is served at BOTH `/api/v1/...` and `/api/...`. The unversioned',
+        'form is an alias kept for the deployed client and should be retired one',
+        'release after clients move over. Only the unversioned form is listed here;',
+        'prefix it with `/v1` for the versioned equivalent.',
+        '',
+        '### Authentication',
+        'Login sets httpOnly `access_token` and `refresh_token` cookies AND returns',
+        'the access token in the body. Browser clients should rely on the cookies.',
+        'Non-browser clients send `Authorization: Bearer <token>`.',
+        '',
+        '### CSRF',
+        'Cookie-authenticated state-changing requests must carry `X-CSRF-Token`,',
+        'fetched from `GET /api/csrf-token`. Requests carrying an `Authorization:',
+        'Bearer` header are exempt, because a cross-site attacker cannot set headers.',
+        '',
+        '### Competition context',
+        'Most admin, coach and judge routes act inside ONE competition. The id is',
+        'resolved from the access token first (set it with `POST',
+        '/api/auth/set-competition`), then the `X-Competition-Id` header, then',
+        '`competitionId` in the body or query. Routes that require it are marked, and',
+        'return `COMPETITION_CONTEXT_REQUIRED` when none is found.',
+        '',
+        '### Errors',
+        'Failures are `{ success: false, error: { message, code, details? } }`.',
+        '`details` maps a field name to its message on a validation failure.',
+      ].join('\n'),
+      contact: { name: 'Mallakhamb India' },
+    },
+    servers: [
+      { url: serverUrl, description: 'Unversioned alias — /api/...' },
+      { url: `${serverUrl}/v1`, description: 'Versioned — /api/v1/... (prepend to the paths below)' },
+    ],
+    tags: [
+      { name: 'Health', description: 'Probes and metrics' },
+      { name: 'Auth', description: 'Sessions, CSRF, password reset, competition context' },
+      { name: 'Players', description: 'Athlete registration and self-service' },
+      { name: 'Coaches', description: 'Squad building, entry and payment' },
+      { name: 'Teams', description: 'Team CRUD' },
+      { name: 'Competitions', description: 'Competition CRUD and entries' },
+      { name: 'Admin', description: 'Competition administration' },
+      { name: 'Judges', description: 'Panel seating' },
+      { name: 'Judge', description: 'The judge-facing scoring client' },
+      { name: 'Scores', description: 'Score sheets and judge slips' },
+      { name: 'Rankings', description: 'Computed standings' },
+      { name: 'Running order', description: 'Lot draw and sequencing' },
+      { name: 'Payments', description: 'Razorpay orders, reconciliation and reporting' },
+      { name: 'Public', description: 'Anonymous endpoints for the public site' },
+      { name: 'Stats', description: 'Profile Stats tabs and the Judge fairness board' },
+      { name: 'Super admin', description: 'Platform-wide administration' },
+      { name: 'Walk-in desk', description: 'Competition-day registration from a paper form' },
+    ],
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http', scheme: 'bearer', bearerFormat: 'JWT',
+          description: 'Also exempts the request from CSRF checking.',
+        },
+        cookieAuth: {
+          type: 'apiKey', in: 'cookie', name: 'access_token',
+          description: 'Set by any login endpoint. Requires `X-CSRF-Token` on writes.',
+        },
+      },
+      schemas,
+    },
+    paths: buildPaths(),
+  };
+}
+
+module.exports = { buildOpenApiDocument, buildPaths };

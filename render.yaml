@@ -1,0 +1,195 @@
+services:
+  # Backend API Service
+  - type: web
+    name: mallakhamb-server
+    env: node
+    # Singapore: Render's nearest region to India. Keep the MongoDB Atlas
+    # cluster in Singapore too (ap-southeast-1); every request crosses to it.
+    #
+    # Render cannot move an existing service between regions — a Blueprint sync
+    # does not relocate it. A service created in another region has to be
+    # replaced by a new one created from this file.
+    region: singapore
+    plan: free
+    rootDir: Server
+    buildCommand: npm install
+    # `preDeployCommand: npm run prepare:db` used to sit here, to apply
+    # migrations once per deploy rather than once per instance. It is gone
+    # because pre-deploy commands are a PAID Render feature and this service is
+    # on `plan: free` — so it never ran, while looking like migrations were
+    # handled. Dead configuration that implies a guarantee is worse than none.
+    #
+    # MIGRATE_ON_START below does the job instead. Safe here specifically
+    # because a free service runs ONE instance: the race that keeps migrations
+    # out of the start path needs two.
+    #
+    # If this service is ever moved to a paid plan AND scaled past one instance,
+    # unset MIGRATE_ON_START and restore preDeployCommand.
+    startCommand: npm start
+    # Render's own probe: no database, so a slow Atlas never fails a deploy.
+    healthCheckPath: /api/health/live
+    envVars:
+      # Keep-alive: the server pings `${RENDER_EXTERNAL_URL}/api/health/ping`
+      # (Render sets that variable) every 10 minutes, so the free plan never
+      # sleeps. Set KEEP_ALIVE=false to turn it off. One always-on free
+      # service uses ~744 of the 750 free instance-hours a month.
+      - key: KEEP_ALIVE_INTERVAL_MINUTES
+        value: 10
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      # Apply pending migrations as the instance starts.
+      #
+      # `npm start` normally reports them and serves anyway, so that a failing
+      # migration cannot take a running service down and two instances cannot
+      # race the same one. Neither risk applies here: free runs a single
+      # instance, and there is no pre-deploy hook on this plan to put the
+      # release step in.
+      #
+      # Without this, nothing on Render ever runs a migration — you would have
+      # to point a laptop at the deployed database and run `prepare:db` by hand
+      # after every release that adds one.
+      - key: MIGRATE_ON_START
+        value: true
+      - key: NGROK_ENABLED
+        value: false
+      # Database - Add in Render Dashboard (sensitive)
+      - key: MONGODB_URI
+        sync: false
+      # JWT Secret - Add in Render Dashboard (sensitive, min 32 chars)
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRES_IN
+        value: 24h
+      # CSRF must stay ON. The auth cookies are SameSite=None in production
+      # (the SPA and this API are different sites on the Public Suffix List),
+      # so the double-submit check is what keeps cross-site writes safe.
+      # See Server/src/utils/security/cookie.util.js.
+      #
+      # DEFAULT IS TRUE — config-manager.js:73 turns CSRF on when this variable
+      # is absent, so leaving it unset in the dashboard is the secure state.
+      #
+      # Deliberately `sync: false` rather than `value: true`, so the DASHBOARD
+      # owns it. Runbook §6 rolls a CSRF-caused login outage back by flipping
+      # this to false, which restarts the service without a redeploy and keeps
+      # every other fix in place — the alternative, rolling back the deploy,
+      # would also revert the roster PII fixes. A Blueprint-owned `value:` would
+      # let the next sync silently reset that mitigation mid-incident.
+      - key: CSRF_ENABLED
+        sync: false
+      # Razorpay - Add in Render Dashboard (sensitive). Required by
+      # services/payment/payment.service.js; the webhook secret backs the
+      # HMAC-SHA256 signature verification on /api/webhooks/razorpay.
+      # Without these, entry-fee payment and reconciliation fail at runtime.
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      # Registration discount code — 100% off a coach's team entry, and the one
+      # switch that lets a team be submitted without paying. Dashboard-owned
+      # (`sync: false`) for the same reason as CSRF_ENABLED: turning it off is
+      # an incident action, and a Blueprint-owned `value:` would let the next
+      # sync switch free entry back on. Both unset means disabled, which is the
+      # correct resting state — the server refuses to boot with the switch on
+      # and DISCOUNT_CODE blank.
+      - key: DISCOUNT_CODE_ENABLED
+        sync: false
+      - key: DISCOUNT_CODE
+        sync: false
+      # Optional. Backs cross-instance JWT invalidation; the app falls back to
+      # an in-memory store when unset, which is per-process and resets on deploy.
+      - key: REDIS_URL
+        sync: false
+      # Bearer token for GET /metrics, scraped by Grafana Cloud
+      # (deploy/monitoring/PLAN.md). Unset = endpoint closed (404). Dashboard-
+      # owned so a Blueprint sync can never blank or overwrite it — the same
+      # value lives in the Grafana scrape job, and the two must match.
+      - key: METRICS_TOKEN
+        sync: false
+      # Walk-in desk OCR: the OCI sidecar's public https://ocr-...sslip.io
+      # address and its bearer token (ocr/README.md). Unset = manual entry only.
+      - key: OCR_URL
+        sync: false
+      - key: OCR_TOKEN
+        sync: false
+      # Email Configuration - Add in Render Dashboard (sensitive)
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      # Free Render blocks outbound SMTP (ports 25/465/587), so Gmail SMTP can't
+      # send from here. Production sends through the Gmail API over HTTPS:
+      # EMAIL_PROVIDER=gmail-api plus the three GMAIL_* keys, all set in the
+      # dashboard (Server/docs/gmail-api-email.md). Dashboard-owned on purpose:
+      # a Blueprint sync that set EMAIL_PROVIDER before the keys existed would
+      # fail startup validation and take the API down.
+      - key: EMAIL_PROVIDER
+        sync: false
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      # Resend Email Service - needs a verified domain; Add in Render Dashboard
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      # Frontend URLs for CORS (where requests come from)
+      # Render is the FALLBACK since 2026-11-17 (deploy/oci/archive/GO-LIVE-PLAN.md §4): if OCI is down,
+      # www/api.mallakhambcompetition.com are pointed here at GoDaddy, so the API must accept the
+      # domain and its mails must link to it. The onrender web address keeps working too.
+      - key: CORS_ORIGINS
+        value: https://www.mallakhambcompetition.com,https://mallakhambcompetition.com,https://mallakhamb-web.onrender.com
+      - key: CLIENT_URL
+        value: https://www.mallakhambcompetition.com
+      - key: FRONTEND_URL
+        value: https://www.mallakhambcompetition.com
+      - key: PRODUCTION_URL
+        value: https://www.mallakhambcompetition.com
+
+  # Frontend Static Site
+  - type: web
+    name: mallakhamb-web
+    env: static
+    rootDir: Web
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false
+      - key: VITE_STORAGE_KEY
+        sync: false
+      # Set VITE_API_URL in Render Dashboard to your backend URL
+      # Example: https://mallakhamb-server.onrender.com/api
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      # The modern equivalent of the line above, and the only place
+      # frame-ancestors can live: browsers ignore it inside the <meta> CSP in
+      # index.html and log an error for it on every page load. Vite sets the
+      # same header in development (Web/vite.config.js).
+      - path: /*
+        name: Content-Security-Policy
+        value: frame-ancestors 'none'
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - path: /*
+        name: Permissions-Policy
+        value: geolocation=(), microphone=(), camera=()
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable

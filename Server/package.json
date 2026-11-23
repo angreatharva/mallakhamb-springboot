@@ -1,0 +1,118 @@
+{
+  "name": "sports-event-backend",
+  "version": "1.0.0",
+  "description": "Backend for Sports Event Entry Web App",
+  "main": "server.js",
+  "scripts": {
+    "start": "node scripts/startup.js",
+    "start:bare": "node server.js",
+    "start:check": "node scripts/startup.js --check",
+    "prepare:db": "node scripts/startup.js --migrate --no-serve",
+    "indexes:sync": "node scripts/startup.js --no-serve --no-migrate",
+    "server": "nodemon server.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "docs:openapi": "node scripts/generateOpenApi.js",
+    "docs:openapi:check": "node scripts/generateOpenApi.js --check",
+    "gmail:token": "node scripts/gmail-oauth-token.js",
+    "perf:seed": "node scripts/perf/seedScale.js",
+    "perf:test": "node scripts/perf/testApi.js",
+    "perf:bench": "node scripts/perf/benchmarkApi.js",
+    "seed": "node scripts/seedAccounts.js",
+    "seed:capture": "node scripts/captureEnvironment.js",
+    "seed:panels:plan": "node scripts/planPanels.js",
+    "seed:panels": "node scripts/seatPanels.js",
+    "seed:panels:one": "node scripts/seatPanel.js",
+    "pay:discount": "node scripts/payWithDiscount.js",
+    "reset:scores": "node scripts/resetScores.js",
+    "create-admin": "node scripts/createAdmin.js",
+    "create-superadmin": "node scripts/createSuperAdmin.js",
+    "migrate:up": "node scripts/migrate.js up",
+    "migrate:down": "node scripts/migrate.js down",
+    "migrate:status": "node scripts/migrate.js status",
+    "env:check": "node scripts/checkEnv.js",
+    "setup": "node scripts/setupAll.js",
+    "setup:list": "node scripts/setupAll.js --list",
+    "setup:dry": "node scripts/setupAll.js --dry-run",
+    "setup:api": "node scripts/setupApi.js",
+    "setup:api:list": "node scripts/setupApi.js --list",
+    "setup:ui": "node scripts/setupUi.js",
+    "setup:ui:list": "node scripts/setupUi.js --list",
+    "seed:api": "node scripts/seedApi.js",
+    "create-competitions": "node scripts/createCompetitions.js",
+    "db:sync": "node scripts/syncDatabase.js",
+    "meet:status": "node scripts/meetStatus.js",
+    "seed:scores": "node scripts/seedScores.js --all",
+    "seed:walkin": "node scripts/seedWalkIn.js",
+    "seed:demo": "node scripts/seedDemo.js",
+    "walkin:fixtures": "node scripts/walkInFixtures.js",
+    "seed:scores:one": "node scripts/seedScores.js"
+  },
+  "keywords": [
+    "sports",
+    "event",
+    "entry",
+    "node",
+    "express",
+    "mongodb"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": "24.x"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.22.3",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^8.3.1",
+    "express-validator": "^7.0.1",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.11.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.0.3",
+    "nodemailer": "^10.1.7",
+    "pdfkit": "^0.17.2",
+    "prom-client": "^15.1.3",
+    "qrcode": "^1.5.4",
+    "razorpay": "^2.9.6",
+    "resend": "^6.10.0",
+    "socket.io": "^4.7.4",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "jest": "^30.4.2",
+    "mongodb-memory-server": "^11.2.0",
+    "nodemon": "^3.0.2",
+    "socket.io-client": "^4.8.3",
+    "supertest": "^7.2.2"
+  },
+  "overrides": {
+    "qs": "^6.17.1",
+    "body-parser": "^1.20.9",
+    "follow-redirects": "^1.16.2"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "<rootDir>/tests/**/*.test.js"
+    ],
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "/tests/"
+    ],
+    "testTimeout": 30000,
+    "setupFilesAfterEnv": [
+      "<rootDir>/tests/setup.js"
+    ],
+    "maxWorkers": 1
+  }
+}

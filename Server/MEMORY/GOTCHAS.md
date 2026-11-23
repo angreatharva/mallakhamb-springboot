@@ -1,0 +1,234 @@
+# GOTCHAS
+
+Traps, dead code, stale-docs conflicts, and things that will bite an agent who
+assumes the obvious. Grouped by subsystem. Every item traces to a source
+citation from the research passes that built this MEMORY set
+(verified against commit `f0bdc1d`, 2026-09-22/23; fixes below applied
+2026-09-23 in a follow-up pass on the same commit lineage).
+
+## Fixed since this MEMORY build (2026-09-23)
+
+The following were live defects/dead code when this MEMORY set was first
+built, and were fixed in a follow-up pass. Kept here, briefly, so a future
+agent doesn't rediscover the same defect from an old comment or a stale copy
+of this doc — see each numbered doc's own body for the current behavior.
+
+- **Tie-breaks follow COP Mallakhamb §1.12 now** (2026-10-17/18). The
+  "senior judge score, then whole-panel mean" rule is gone; so is any idea of
+  a random draw in code. 3-judge: time, then a lucky draw. 4/5-judge: base
+  score → plain mean of the four judges → (mean + Chief)/2 → lucky draw. The
+  draw is held physically and recorded by an admin (`TieBreakDraw`). Old
+  comments, tests or the archived "v2 spec §7" cascade must not be restored.
+  See [07-SCORING-ENGINE.md](07-SCORING-ENGINE.md).
+- **Team Championship counts best 3 / best 5 per apparatus** (2026-09-25),
+  set by the meet's `maxTeamSize`. It used to rank every athlete's summed
+  score, so a squad scored more by entering more athletes.
+- **A clean `SIGTERM` exited 7** until 2026-10-17: `graceful-shutdown.js`
+  logged after ending the winston logger. Everything there logs through
+  `this.log()` now.
+- **A refused CORS origin answered 500** until 2026-10-17 (a plain `Error`),
+  feeding the "High 5xx" alert. It is an `AuthorizationError` → 403 now.
+- **`.env_example` shipped a working discount code, enabled** — off and a
+  placeholder since 2026-10-17. The old public code `BRMC@2026` was replaced
+  on Render and in the OCI staging Vault secret on 2026-10-19. To change the
+  staging code: update the **whole** env in the Vault secret, restart the API
+  on the active VM (`ExecStartPre` re-renders it), and run
+  `sudo mallakhamb-render-env` on the standby.
+
+- **`POST /api/auth/reset-password/:token` is gone** (2026-10-07). It was
+  "fixed" on 2026-09-23 by implementing `resetPasswordWithToken`, which
+  turned a 500 into a takeover: it matched the token against the OTP field
+  with no email, so any 6-digit guess reset whichever account had a pending
+  code. Removed with its controller, service method and SPA route. Don't
+  bring it back. See [06-AUTH-AND-SECURITY.md](06-AUTH-AND-SECURITY.md).
+- **`POST/DELETE /api/competitions/:id/admins(/:adminId)` no longer 500s.**
+  `CompetitionService.assignAdmin`/`removeAdmin` are now implemented
+  (`src/services/competition/competition.service.js`), mirroring
+  `SuperAdminService.assignAdminToCompetition`/`removeAdminFromCompetition`'s
+  bidirectional-update pattern. See [modules/competition.md](modules/competition.md).
+- **The Razorpay webhook is now idempotent against redelivery.**
+  `Transaction` has a new unique+sparse index on
+  `metadata.razorpay_payment_id` (migration `011_transaction_webhook_idempotency.js`),
+  and `PaymentService.reconcileWebhook` treats a Mongo `11000` on that insert
+  as "already recorded" rather than an error. See [09-PAYMENTS.md](09-PAYMENTS.md).
+- **`competition_{id}` socket rooms now have members.** Every authenticated
+  socket auto-joins its own `competition_{id}` room at connect, from the
+  trusted JWT `competitionId` claim (`socket.manager.js:handleConnection`).
+  `NotificationHandler` is no longer dead code — it now registers real
+  `join_competition_room`/`leave_competition_room` listeners (for a socket
+  whose context wasn't known at handshake, or that switches competition
+  mid-session) using the same `socketManager.joinRoom(...)` + validator
+  pattern the scoring-room join uses. `competition.service.js`'s
+  `competition:${id}` (colon) spelling was also fixed to match everyone
+  else's `competition_${id}` (underscore). This makes the previously-dead
+  `TEAM_APPROVED`/`TEAM_REJECTED`/`AGE_GROUP_STARTED`/`AGE_GROUP_ENDED`/
+  `SCORES_LOCKED`/`SCORES_UNLOCKED`/`COMPETITION_UPDATED`/
+  `COMPETITION_STATUS_UPDATED` broadcasts reach someone for the first time.
+  See [08-REALTIME-SOCKETS.md](08-REALTIME-SOCKETS.md).
+- **`FeatureFlagService` was removed entirely**, not just left orphaned —
+  the class, its DI registration, its directory, and the now-unused
+  `getFeatureFlags()`/`features.flags`/`FEATURES_FLAGS` config surface are
+  all gone. `features.enableCaching`/`enableMetrics` were untouched (kept,
+  even though they too currently have no reader — out of scope for this
+  pass). See [12-CONFIG-AND-ENV.md](12-CONFIG-AND-ENV.md).
+- **Cache warming now actually runs.** Both entrypoints (`server.js`,
+  `scripts/startup.js`) call `warmCache()` (fire-and-forget, non-blocking,
+  matching the existing Redis-connect/status-sweeper pattern) after listen.
+  `CacheWarmer.warmUser()` remains a no-op (`userService` still has no
+  single DI-registered instance to warm) — not addressed, since inventing
+  what "warm all users" should mean wasn't part of this fix. See
+  [10-CACHING-AND-PERF.md](10-CACHING-AND-PERF.md).
+
+Regression tests added: `tests/unit/services/competition/competition.service.test.js`
+(new file — `assignAdmin`/`removeAdmin`), `tests/integration/payment-webhook-reconcile.test.js`
+(redelivery case), `tests/integration/socket/scoring-socket.test.js` (competition-room
+auto-join and explicit join/leave). Full suite green: 57 suites / 720 tests.
+
+## Dead / unreachable code (confirmed, not just suspected)
+
+- **`AuthorizationService`'s RBAC surface was deleted, but its README wasn't updated.** `checkRole`, `checkMinimumRole`, `checkCompetitionAccess`, `checkResourceOwnership`, `checkResourceAccess`, and a `roleHierarchy` map are all gone (the file's own header comment documents this); real role guards now live in `auth.middleware.js` (`requireRole`, `requireAdmin`, `requireJudge`, `requireAdminOrScorer`, `requireSequenceManager`, `requireSuperAdmin`). The service's live exports are only `canJudgeScore` and `getJudgeDetails`.
+- **`AdminService`'s `AuthorizationError` import appears unused** in the 2047-line file (⚠️ not exhaustively proven, but not observed thrown anywhere in a full read).
+- **`NotificationHandler`'s original five outbound methods** (`sendToUser`, `sendToCompetition`, `broadcastCompetitionUpdate`, `broadcastTeamUpdate`, `broadcastPlayerUpdate`) still have no callers — only its (new) inbound join/leave listeners are live. They remain available, unused API surface, same as `getPublicRankings` elsewhere.
+
+## Stale documentation (contradicts the code)
+
+- **`src/services/auth/README.md`**: documents a 5-role hierarchy (`player < coach < judge < admin < super_admin`) and 5 `AuthorizationService` methods that no longer exist (deleted, per that file's own header comment — see above). Claims "Token Expiration (default: 1 hour)"; actual default is 24h (`JWT_EXPIRES_IN` fallback in `config-manager.js:50`, and `token.service.js`'s own header comment). Lists account lockout, OTP email integration, and logout token invalidation as "Future Enhancements" — all three are fully implemented today. Test-file references (`token.service.test.js`, `authorization.service.test.js`) don't exist in the repo.
+- **`src/services/scoring/README.md`**: lists `calculateAverage`/`calculateTeamTotal` as `CalculationService` methods — neither exists (the real exports are `calculateFinalScore`, `calculateRankings`, `calculateTimeDeduction`, `calculateCompletePlayerScore`, `getIndividualRankingsWithTieBreaker`). Its worked example for `calculateCompletePlayerScore` omits `seniorJudge` from the input and asserts an output the actual 4/5-judge algorithm couldn't produce from that input (it would short-circuit to zeros with no senior score present). Contains no description at all of the panel-size-dependent tie-break algorithm (`utils/scoring/tie-breaker.util.js`) despite it being a substantial, precisely-specified piece of domain logic.
+- **`src/socket/README.md`**: documents the scoring-room id format as `{competitionId}_{gender}_{ageGroup}_{competitionType}` — the real format has no competitionId and exists in two simultaneous forms (slug and display, actual helper is `scoringRoomIds` in `utils/data/scoring-room.util.js`). Documents `competition_{id}`/`team_{id}` rooms and `notification`/`competition_update`/`team_update` events as things a client can join/receive live data from — this is now MOSTLY true again (see the "Fixed" section above for `competition_{id}`), but the README still describes the wrong room-id format for scoring rooms and doesn't mention the new explicit `join_competition_room`/`leave_competition_room` events at all. Not independently updated in this pass — treat with care.
+- **`Team.js:8`** (model header comment) references a "CompetitionTeam model" that does not exist in this codebase — that data was folded into `Competition.registeredTeams[]`. Documentation drift only, not a behavioral bug.
+- **`docs/razorpay-payment-handling.md`** shows a fabricated pricing formula (`(500 + playerCount*100)*100`) that matches nothing in the actual code (real pricing is per-meet `playerFee` + apparatus add-ons + late fee via `payment.config.js`); claimed idempotent webhook processing (now actually true, see the "Fixed" section above, though the doc's own explanation of *why* is still wrong); shows a `matchingCompetition.save()` code sample when the real write is an atomic `arrayFilters` update; and conflates two genuinely separate HMAC schemes (client-callback `order_id|payment_id` vs. webhook whole-raw-body). See [09-PAYMENTS.md](09-PAYMENTS.md).
+- **`render.yaml`**'s own inline comments document a *fixed* piece of drift worth knowing about even though it's not "stale" now: `preDeployCommand: npm run prepare:db` used to be configured but silently never ran (pre-deploy commands are a paid Render feature; this service is on the free plan) — `MIGRATE_ON_START=true` now does that job instead, safe specifically because the free plan runs exactly one instance.
+
+## Stale documentation — ops/deployment/testing docs (severe)
+
+- **`docs/architecture.md` is stale.** Lists `timing.middleware.js` and `feature-flag.middleware.js` as live components — the middleware was deleted in the 2026-08 audit, and `FeatureFlagService` itself is now gone too (see the "Fixed" section above). Its middleware-order description is a simplified/incomplete version of the real chain in [01-ARCHITECTURE.md](01-ARCHITECTURE.md). Its directory-structure section shows `tests/e2e/`, `tests/fixtures/`, `tests/mocks/`, `tests/helpers/` — none exist (real layout: `tests/{unit,integration,security}/` + `setup.js`). It also still lists a `feature-flags/` service directory in its file tree, which no longer exists.
+- **`docs/testing-guide.md` is partly stale** — correctly documents the real Sept-22 test consolidation, but its E2E/fixtures/helpers examples (`tests/e2e/`, `tests/fixtures/factories.js`, `tests/mocks/*.js`, `tests/helpers/test-setup.js`) describe paths that don't exist. Assumes a unified `POST /api/auth/login` with a `userType` body field — the real API has no such endpoint (each role logs in on its own router).
+- **`docs/troubleshooting-guide.md`** shares the same stale unified-login assumption, and references `node test-email-services.js`, which doesn't exist anywhere in `Server/`.
+- **`docs/api-documentation.md`** documents `AuthenticationService.login(email, password, userType)` as if reachable via a single HTTP endpoint — the internal service method does take a `userType` param, but no HTTP route exposes a unified login; every role has its own route/controller (see [06-AUTH-AND-SECURITY.md](06-AUTH-AND-SECURITY.md)). It also still documents `FeatureFlagService` (`src/services/feature-flags/feature-flag.service.js`) — that file no longer exists.
+- **`Server/README.md` is internally inconsistent.** Its own directory map says `unit/ (20)` while its Testing section (and reality) says 33+ unit suites — not updated after the consolidation it otherwise describes correctly, and now further out of date (34 unit suites after this pass's additions). Its "Stale entries" callout claims `migrate:up/down/status` are broken aliases and that `scripts/` "holds only the two create-user scripts" — **both false**: `scripts/migrate.js` exists and works, and `scripts/` holds ~24 tracked top-level files plus `lib/`/`perf/`. That same paragraph lists several npm scripts (`populate-db`, `create-coach`, `test-email`, etc.) that don't exist in the current `package.json` at all — this "stale entries" section is itself the stale artifact. Its migrations list (`001`, `002`, `migrate-superadmin-role.js`, `migration-template.js`) is incomplete (real count: 001-011 after this pass) (`migrate-superadmin-role.js`, the one-time role rename, was deleted 2026-11-21.) Also still lists a `feature-flags/` directory under `src/services/` that no longer exists.
+- **`src/config/README.md`** and **`src/validators/README.md`** are both largely accurate; their only staleness is a leftover `npm test -- src/...` invocation referencing a test path under `src/` that no longer exists post-consolidation.
+- **`docs/dependency-injection-guide.md`**: example code writes `const container = bootstrap();`, but every real caller does `const { container } = bootstrap();` — `bootstrap()` returns an object, not the container directly.
+
+## Dead/vestigial configuration
+
+- ~~`RAZORPAY_WEBHOOK_SECRET` has zero code consumers~~ — **fixed 2026-10-17** (deploy C1.3 / F4). `PaymentService.verifySignature` now uses it, falling back to `RAZORPAY_KEY_SECRET` with a one-time warning when it is unset. The two secrets are different: the webhook secret is the one typed into Razorpay → Webhooks.
+- **`NGROK_ENABLED`/`NGROK_AUTH_TOKEN`** — documented and present in `render.yaml`/`.env_example`, but no `process.env.NGROK*` reference exists anywhere in the codebase.
+
+## Live defects / correctness risks (not dead code, but wrong or fragile)
+
+- **`RegistrationService.updateRegistrationStatus` and the webhook's `applyPaymentWebhookResult` are two independent code paths that can both set `paymentStatus`** — know both exist before assuming there's one writer.
+- **`AuditLog.adminId` has no `ref`** in the schema, yet `AuditLogRepository.getAuditLogs` calls `.populate('adminId', 'name email username role')` on it. ⚠️ UNVERIFIED whether this silently no-ops at runtime or throws — check before relying on populated audit-log reads.
+- **`CompetitionRepository.addTeam` and `.updateRegistration` still use read-modify-`.save()`** against the `registeredTeams` embedded array, the exact pattern the rest of the file (`removeTeam`, `updateRegistrationFields`, `updatePlayerInRegistration`, etc.) was rewritten with `arrayFilters`/atomic ops specifically to avoid — a `.save()` after reassigning the array marks the *whole path* dirty and can discard concurrent edits made by another coach since the document was read. Not confirmed fixed; flagged for a future pass.
+- **`SuperAdminService.getSuperAdminDashboard`'s "all competitions" branch** loops per-competition with sequential player queries — a potential N+1 at scale, not optimized the way `getAllTeams`/`getSubmittedTeams` were.
+- **`graceful-shutdown.js`'s `waitForInFlightRequests()`** doesn't appear to actually track open sockets/requests — it checks `server.listening` right after `server.close()`'s own callback already fired, so the configured 30s `shutdownTimeout` may never meaningfully come into play as "wait for requests to drain." ⚠️ UNVERIFIED as a functional bug vs. intentional simplification.
+- ~~`flushLogsAndMetrics()`'s metrics-flush branch is dead~~ — removed 2026-10-03 with the old `MetricsCollector`; the step now only flushes the Winston logger.
+- **`DatabaseConnection` has no custom reconnect for a connection that drops post-startup** — the retry/backoff logic only covers the *initial* connect; once connected, a later `disconnected` event is only logged, and reconnection is left entirely to the MongoDB driver's own topology monitoring. `src/infrastructure/database/README.md` overstates this as something the module "tracks."
+- **`getPoolStats()`** reads `mongoose.connection.db.serverConfig?.s?.poolSize`-style paths that are likely version-fragile against the modern driver and probably always resolve to `'N/A'` — the README's own example output shows exactly that.
+
+- **`SuperAdminService.addPlayer`'s Mongo transaction doesn't cover the Player insert.** `PlayerRepository.create`/`BaseRepository.create` take no options, so the `{ session }` it passes is ignored (noted in `player.repository.js`, 2026-10). The walk-in desk avoids transactions entirely for the same reason and makes submit resumable instead.
+
+## Traps for a future agent (behavior that looks wrong but is deliberate — don't "fix" these)
+
+- **Player identity (2026-10) — read [modules/accounts.md](modules/accounts.md) first.**
+  - `Player.emailType` read off a `.lean()` row is `undefined` for every pre-2026-10 player — use `emailTypeOf()`, which treats missing as `self`.
+  - A player's `email` is unique **only** when `emailType` is `self`. Querying by email without `OWN_EMAIL_CLAUSE` can return a sibling's account via a shared guardian address.
+  - `loginId` is the Player ID. Request bodies already use `playerId` for the Mongo `_id` — don't rename either.
+  - A Player ID is **never recomputed** after a name/DOB correction, on purpose.
+  - Forgot-password for a no-email player returns the same 200 as everyone else and **sends nothing** — the reset waits on their coach. That is not a broken mailer.
+  - **Coaches cannot be deactivated** (`updateCoachStatus` refuses `false`). Don't restore the toggle without deciding who then owns their players' requests.
+  - A coach's `playerDefaultPassword` is encrypted, **not hashed**, on purpose — the coach must be able to read it back. Don't "fix" it to bcrypt.
+- **`PUT /auth/me/password` re-issues the token with `iat` set to the next whole second.** Without it, the new token is refused by the logout check it just triggered.
+
+- **`LOCKED_STATUS = 423`, not 403**, for a competition-lock refusal. Deliberate: the SPA already treats a 403 mentioning a competition as "stale competition context" and bounces the user to competition selection; reusing 403 here would trigger that redirect and effectively log out an admin legitimately *reading* a locked meet.
+- **A missing `endDate` does NOT lock a competition.** Fails open on purpose (defensive-only case for partial seeds/fixtures) — every other access rule (`competition-access.util`) still applies underneath, so "unlocked" here never means "unguarded."
+- **A failed competition-lock DB lookup fails CLOSED (500), not open.** The one asymmetry in the lock guard: letting a write through because the lock status couldn't be determined would make the lock bypassable by whatever broke the read.
+- **`competition-lock.middleware.js` is mounted per-route, never as `router.use`.** Doing so at the router top would run before that router's own `authMiddleware`, so `req.user` wouldn't exist yet for the superadmin exemption check.
+- **`/auth/refresh` is a public route with no `authMiddleware`.** It authenticates purely off the refresh-token cookie (path-scoped to `/api/auth/refresh`), by design — a request with an expired access-token cookie but a valid refresh-token cookie must still be able to refresh.
+- **Two independent token-rotation mechanisms coexist and don't share code**: `auth.middleware.js`'s silent 12h-threshold access-token re-sign (`rotateTokenIfNeeded`), and the explicit, client-invoked, theft-detecting refresh-token rotation via `POST /auth/refresh`. Don't conflate them when reading "rotation" in a file.
+- **Refresh-token reuse detection revokes the WHOLE family**, not just the reused token — the intended theft response is "kill the whole session chain, force full re-login."
+- **OTP codes are stored in plaintext** on the user document (`resetPasswordToken`/`resetPasswordExpires`), not hashed — inconsistent with `RefreshToken`'s hash-only storage, but this is the current, confirmed behavior; `utils/auth/otp.util.js` ships an unused `hashOTP` helper nobody calls. The wrong-guess cap (`resetPasswordAttempts`, `OTP_MAX_ATTEMPTS`) and the constant-time compare are what make plaintext tolerable for a 10-minute code.
+- **Email metric history before 2026-10-19 says `provider="other"`.** `prometheus/registry.js`'s `EMAIL_PROVIDERS` allow-list lacked `gmail-api` (what production runs) until then, and `pick()` maps anything off the list to `other`. Fixed; a new provider must be added to that set or it repeats.
+- **`EMAIL_PROVIDER=none` silences every email** (OTPs included). It exists for the nightly e2e and `config-manager` refuses it in production unless the DB name ends in `_e2e` — keep that guard if you touch it.
+- **SMTP never leaves free Render.** Ports 25/465/587 are blocked, so the default `nodemailer` provider times out there while working perfectly locally. Production must run `EMAIL_PROVIDER=gmail-api`. See [modules/email.md](modules/email.md).
+- **`.env_example` selects `EMAIL_PROVIDER=gmail-api` (since `8d0dc23`), and blank Gmail keys stop boot in any environment.** `config-manager` only requires the Gmail keys in production, so validation passes locally — then `GmailApiAdapter`'s constructor throws `missing configuration: clientId, …` while the DI container builds `EmailService` at startup. A new dev copying `.env_example` must fill `GMAIL_*` or set `EMAIL_PROVIDER=nodemailer`. (Verified 2026-10-11 by constructing `EmailService` with blank keys.)
+- **A `GMAIL_REFRESH_TOKEN` that doesn't start `1//` was mangled in a paste.** Google's only answer is `invalid_grant: Bad Request`; the adapter now warns at startup and surfaces Google's `error_description`. Re-run `npm run gmail:token`, which tests the token before printing it.
+- **A new account model needs `resetPasswordToken`, `resetPasswordExpires` and `resetPasswordAttempts`.** `Admin.js` lacked them until 2026-10-07; strict mode dropped the OTP silently and no admin or superadmin could ever reset. `tests/unit/models/password-reset-fields.test.js` guards the four existing models.
+- **`emailService.sendNotification` has zero callers.** (`sendPasswordReset` is now the "password changed" notice after a reset.)
+- **Superadmin login is not a separate credential store.** `SuperAdminService.loginSuperAdmin` calls the same `AuthenticationService.login(email, password, 'admin')` as a regular admin, then checks `result.user.role === 'superadmin'` post-hoc.
+- **Judges cannot call `/api/auth/set-competition`.** `AuthenticationService.setCompetitionContext` explicitly throws `AuthorizationError` for judge callers by design — judges must use the judge-specific `PUT /api/judge/competition/:competitionId/set`, which independently re-sets the access-token cookie (a fix for a prior bug where only the response body was updated and the cookie kept serving the old competition).
+- **`score_identity_unique` includes `competitionType`, and this is load-bearing** (HIGH-3 fix) — omitting it from a lookup, as an earlier version did, let scoring a team in Competition II silently find and overwrite its Competition I document. Any new score-identity query must include it.
+- **Squad-place identity for a score row is `(player, apparatus)`, not `player` alone** — matching on playerId only silently merges results across apparatus, keeping only the last-judged one.
+- **`isLocked` (whole Score doc) and `lockedApparatus[]` (per-apparatus) are two separate freezes**, because one Score document covers all three apparatus for a team/category but panels are seated per-apparatus. A first save that also carries `isLocked` does NOT set the whole-document lock for this reason — don't assume they move together.
+- **`modifiedCount` lies for `arrayFilters` updates** against `Competition.registeredTeams` — Mongoose bumps `updatedAt`/`__v` regardless of whether the array-filter condition actually matched anything, so affected repository methods check `matchedCount` (via a query-side `registrationFilter`), never `modifiedCount`, to detect a "no such registration" case.
+- **Every registration write against `Competition.registeredTeams` must be team-addressed** (via `arrayFilters` keyed on team/player identity), never by array index — a position captured moments earlier is invalid the instant a concurrent coach's team is added/removed, and the failure mode is a silently corrupted *different* coach's registration, not an error.
+- **`apparatusList`/`toCanonicalApparatus`/`isCanonicalApparatus`** in `utils/data/apparatus.util.js` must keep reading all three historical shapes of `registeredTeams[].players[].apparatus` indefinitely — migration 008 is a one-time backfill, not a guarantee every row is canonical.
+- **`Score.competitionType` is stored in display form** (`'Competition I'`), while `Judge`/`Competition`/`PerformanceOrder` all use slug form (`competition_1`) — conversions always go through `cop-rules.js`'s `toCompetitionTypeSlug`/`toCompetitionTypeDisplay`, never a hand-rolled string replace (a `.replace('Competition I', ...)` on `'Competition III'` is the exact bug `COMPETITION_TYPE_DISPLAYS`' longest-first sort was written to prevent).
+- **A judge's `judgeType` is a property of the seat assignment (`Judge`), never the account (`JudgeAccount`)** — one person can be Senior Judge in one category and Judge 2 in another; always resolve via the assignment matching the category in play, never trust a client-supplied role.
+- **`saveScores`' per-player finalize lock (`isFinalized`) and the whole-document admin `isLocked` are different locks with different override rules** — `isFinalSubmit`/`allowFinalizedEdit` can get past the former; nothing gets past the latter except an explicit admin unlock.
+- **Superadmin's single-athlete `createPlayerPaymentOrder` bypasses the registration WINDOW, not the PAYMENT** — the athlete still pays (including any applicable late fee); only the time-based block is lifted.
+- **A `POST /api/public/payments/razorpay/webhook` is intentionally exempt from the competition lock** — refusing it after lock wouldn't undo the charge, only lose the record, and Razorpay would keep retrying a request designed to be idempotent.
+- **A coach/player/judge socket can only `join_competition_room` for its OWN authenticated competition** (`socket.competitionId`, the JWT claim) — admins/superadmins may join any competition's room. Don't loosen this without a reason; it's what stops the explicit join event from being used to eavesdrop on a different meet's broadcasts.
+- **`PlayerService.getAvailableTeams()` takes zero parameters and silently discards the `competitionId` its own controller passes.** `player.controller.js`'s `getAvailableTeams` handler resolves a `competitionId` and calls `playerService.getAvailableTeams(competitionId)`, whose own JSDoc claims competition-scoping — the service method ignores the argument entirely and returns the top 50 active teams globally.
+- **Coach registration does not enforce password complexity, unlike player registration.** `coach.routes.js`'s inline `registerValidation` only checks `isLength({min:8})`; `player.validator.js`'s `createPlayer()` uses `common.validator.js`'s `password()`, which additionally requires upper+lower+digit. Two registration flows, two different strength rules.
+- **`player.controller.js`'s `getOpenCompetitions` handler resolves `competitionService` directly from the container**, bypassing `playerService` entirely, despite a comment claiming it "reuses the coach service method" (it doesn't — stale comment, functionally harmless).
+- **`player.validator.js` exports `updatePlayer`, `getPlayerById`, `deletePlayer`, `assignTeam`** with no matching route anywhere in `player.routes.js` — likely orphaned exports (not verified against other consumers outside this router).
+- **`team.controller.js`'s `getTeamStats` has a duplicate-logic fallback**: it prefers `teamService.getTeamStats`, but if that's falsy it recomputes the same byGender/byAgeGroup histogram inline in the controller — despite the file's own header comment claiming the calculation "moved to TeamService" to stop it leaking into the controller.
+- **`TeamService.validateTeamForCompetition` and `getTeamRoster` appear to have no caller** in `team.controller.js` — `getTeamRoster` in particular returns an un-narrowed player shape (unlike `getTeamById`'s CRIT-4-fixed narrow projection), which would be a live PII exposure if something ever did call it.
+- **`super-admin.routes.js` reuses `adminController`/`performanceOrderController` handlers for most of its surface**, not `superAdminController` — only login, player-payment, admin/coach/team/competition CRUD, and judge-deletion are genuinely superadmin-owned code. The superadmin lot-draw routes deliberately omit `validateCompetitionContext` (a superadmin isn't scoped to one meet) unlike the admin router's equivalents — don't assume the two mirror each other exactly.
+- **`coach.controller.js`'s `@route` JSDoc comments are wrong** — they say singular `/api/coach/...` throughout; the real mount is plural `/api/coaches/...`, and at least one comment names a path (`/api/coach/players/search`) that never existed (real route: `/coaches/search-players`). Cosmetic only, but confusing when grepping comments for the real path.
+
+## Open items needing a follow-up pass
+
+- Whether `Coach.team` and `Team.coach` are always kept as exact inverses.
+- Whether `tests/unit/routes/admin.routes.test.js` is currently passing — project memory flags it as a known-failing test; it passed in this pass's full-suite run (57/57 suites, 720/720 tests), but that hasn't been reconciled with the older memory note.
+- Whether `src/socket/README.md` should be rewritten now that `competition_{id}` rooms are live again — flagged stale above, not rewritten in this pass.
+
+## Since the last pass (2026-10-30, against `4201319`)
+
+- **`AllAges` filtering lives in TWO places in
+  `competition.repository#findSubmittedRegistrations`** — the `$match` and the
+  `$filter` cond. Skipping it in only one returns zero finalists.
+- **Finalized/started finals never change.** A later Comp I correction only
+  sets `staleSince` (a warning on the card). Reopen is Super Admin only and is
+  refused once any Comp II/III score exists for that final.
+- **`entry.apparatus.competition_2/3` belong to the engine.** Coach and Super
+  Admin squad writes strip them (unless `legacyFinals`); hand-written values are
+  overwritten by `_syncEntries`, which writes FINALIZED finals only.
+- **Coaches are emailed about qualifiers only on Finalize**, never on recompute.
+- **A player's team at a level is written only by `PlayerTeamService`**
+  (conditional `$push`); a second writer would let two teams win the race.
+- **Age cut-off has no override** — don't reintroduce `Competition.ageCutoff`.
+
+- **`caddy validate` as root breaks the next reload** (2026-10-30 drill): it creates any missing
+  access log root-owned, Caddy (user caddy) then cannot open it, the reload fails with "permission
+  denied", and `set -e` stopped `mallakhamb-promote` before the API started — 3 min of staging
+  downtime. Always `runuser -u caddy -- caddy validate`, and chown `/var/log/caddy`.
+- **Moving an OCI reserved IP is `PUBLIC_IP_UPDATE`**, which `use public-ips` does not grant (404
+  NotAuthorizedOrNotFound). The failover policy has `manage public-ips where request.permission =
+  'PUBLIC_IP_UPDATE'`.
+- **A hidden replica-set member is never selected through a replica-set URI**, whatever the read
+  preference; reach db-03 with `directConnection=true` (`mallakhamb-backup-source`).
+
+## Since the last pass (2026-11-11, against `f5465b4`)
+
+- **Coach code must use `teamCoachOf(req)`.** A co-coach's `req.user._id` is
+  not the team's coach. Any new coach endpoint that filters by
+  `req.user._id` silently shows a co-coach nothing.
+- **A Scorer's save body is ignored** except Time and Other Deduction. The
+  seat is read from the token, not the body. Don't "fix" missing marks by
+  sending them from the Scorer.
+- **Panel size** comes from the seats (`seated-panel.util`). The guess from
+  the marks is only a fallback for when the seats cannot be read.
+- **`paymentStatus: 'completed'` without `isSubmitted`** is a real state
+  (written by the webhook). Check both when deciding whether a squad is
+  locked.
+- **`Club`** is still in the `JudgeAccount` level enum, but the validator
+  refuses it on new writes.
+- **Old single-pair cookies** (`access_token` / `refresh_token`) are still
+  read for their own role until the next sign-in. Don't delete that fallback
+  while live sessions may still use it.
+- **A Scorer cannot lock before the Senior Judge has marked.** A seeder or e2e
+  step that locks as the Scorer must have the Senior Judge mark every athlete
+  first, or the lock comes back 400.
+
+- **2026-11-21 cleanup:** `docs/system-handbook.md`, `docs/deployment-guide.md`, `docs/migration-guide.md`, the raw `docs/perf-*.json` snapshots and `scripts/migrate-superadmin-role.js` were deleted (stale or one-off).

@@ -1,0 +1,196 @@
+---
+doc: 00-INDEX
+covers:
+  - Server/**
+read_when: "always — the entry point for any change in Server/"
+depends_on: []
+verified_against_commit: f5465b4
+last_verified: 2026-11-11
+---
+
+# MEMORY — router
+
+**What this is.** A layered Express 4 + Mongoose 8 API running Mallakhamb
+gymnastics competitions: registration + Razorpay payment (coaches enter
+teams), live judge-panel scoring over HTTP and Socket.IO, running-order/lot
+draw, and public results. Five roles — player, coach, admin, superadmin,
+judge — the last split into an account (`JudgeAccount`) and per-meet panel
+seats (`Judge`). One process serves HTTP and Socket.IO together. Built against
+commit `f0bdc1d` (2026-09-23); brought up to date against `06891b5`
+(2026-10-18) — tie-breaks per COP §1.12 with admin-recorded lucky draws,
+per-competition team size and best-N Team Championship, apparatus per gender,
+the Time Keeper seat, Prometheus metrics, and the OCI staging build.
+Refreshed again against `ff89ca5` (2026-10-21): Player IDs and players
+without their own email (migration 012), the account page for every role,
+coach-approved resets, coach-registered players, and the walk-in desk.
+Refreshed against `4201319` (2026-10-30): the Stats API and judge-slip authorship
+(013), a player's team final per competition level (014) with the Super
+Admin Players page and the coach paper form, the COP age rule at every squad
+entry with the cut-off fixed to 31 Dec of the meet's year (015), and the
+automatic Competition II/III finals behind an admin Finalize gate (016).
+
+## Read order for a cold agent (only 3 docs)
+
+1. **[01-ARCHITECTURE.md](01-ARCHITECTURE.md)** — layers, DI wiring, request
+   pipeline, startup/shutdown. Everything else assumes this.
+2. **[03-DOMAIN-MODEL.md](03-DOMAIN-MODEL.md)** — what the entities mean and
+   the cross-cutting invariants (competition-type slug/display split,
+   apparatus's 3 stored shapes, soft-delete only on Competition, seat-vs-
+   account for judges). Most bugs in this codebase trace to violating one of
+   these.
+3. **[GOTCHAS.md](GOTCHAS.md)** — dead code, stale docs, and traps. Read
+   before trusting any single file's comments at face value.
+
+## Folder map
+
+| Path | Purpose |
+|---|---|
+| `server.js`, `scripts/startup.js` | The two entrypoints — [01-ARCHITECTURE.md](01-ARCHITECTURE.md) |
+| `src/infrastructure/` | DI container, app assembly, DB/Redis/migrations/health/metrics/logging/shutdown — [modules/infrastructure.md](modules/infrastructure.md) |
+| `src/config/` | Env loading + validation, payment fee-window/pricing logic — [12-CONFIG-AND-ENV.md](12-CONFIG-AND-ENV.md) |
+| `src/models/` | Mongoose schemas — [04-DATA-MODEL.md](04-DATA-MODEL.md) |
+| `src/repositories/` | Query layer, one per model — [modules/repositories.md](modules/repositories.md) |
+| `src/services/` | Business logic, one subdir per domain — see the big table below |
+| `src/controllers/`, `src/routes/`, `src/validators/` | HTTP surface — [05-API-SURFACE.md](05-API-SURFACE.md) |
+| `src/middleware/` | Auth, CSRF, rate limits, competition scope/lock, validation, correlation, metrics, audit, coalescing — [modules/middleware.md](modules/middleware.md) |
+| `src/socket/` | Socket.IO — [08-REALTIME-SOCKETS.md](08-REALTIME-SOCKETS.md) |
+| `src/utils/` | Shared helpers, split by concern — [modules/utils.md](modules/utils.md) |
+| `src/services/walk-in/`, `../ocr/` | Walk-in desk + OCR sidecar, COP age rule — [modules/walk-in-desk.md](modules/walk-in-desk.md) |
+| `src/services/auth/account*.service.js`, `src/services/user/coach-player.service.js`, `src/utils/data/player-login-id.util.js` | Player IDs, guardian/no email, `/auth/me/*`, coach approvals, coach-registered players — [modules/accounts.md](modules/accounts.md) |
+| `src/services/stats/`, `src/utils/stats/` | Profile Stats + judge Fairness, published-mark rule, slip authorship — [modules/stats.md](modules/stats.md) |
+| `src/services/scoring/qualification.service.js`, `src/utils/scoring/qualification.util.js`, `src/models/Qualification.js` | Automatic finals (Comp I → II/III), Finalize gate, All-ages category — [modules/scoring.md](modules/scoring.md) |
+| `src/services/team/player-team*.service.js`, `src/utils/data/age-eligibility.util.js` | Team final per level, Super Admin Players page, COP age rule — [modules/team.md](modules/team.md) |
+| `src/errors/` | Error taxonomy — [02-CONVENTIONS.md](02-CONVENTIONS.md) |
+| `src/migrations/` | Schema/data migrations — [04-DATA-MODEL.md](04-DATA-MODEL.md) |
+| `scripts/` | Seed/ops/perf scripts — [13-SCRIPTS-AND-OPS.md](13-SCRIPTS-AND-OPS.md) |
+| `tests/` | unit/integration/security — [14-TESTING.md](14-TESTING.md) |
+| `render.yaml` | Deployment — [15-DEPLOYMENT.md](15-DEPLOYMENT.md) |
+
+## "I need to do X — what do I open?"
+
+| Task | Read these MEMORY docs | Then open |
+|---|---|---|
+| Add/modify an API endpoint | `CHANGE-RECIPES.md#add-endpoint`, `05-API-SURFACE.md` | the domain's `routes/validators/controllers`, owning service |
+| Change scoring maths / tie-breaks | `07-SCORING-ENGINE.md` | `src/config/cop-rules.js`, `src/utils/scoring/*`, `src/services/scoring/calculation.service.js` |
+| Change the lucky draw (a tie the rules can't break) | `07-SCORING-ENGINE.md` (tie-break section) | `src/utils/scoring/tie-breaker.util.js` (`resolveLuckyDraws`), `src/services/scoring/tie-break-draw.service.js`, `src/models/TieBreakDraw.js`, `Web/src/components/scores/LuckyDrawPanel.jsx` |
+| Change Team Championship / squad size | `07-SCORING-ENGINE.md` (Team Championship), `03-DOMAIN-MODEL.md` | `src/utils/scoring/team-championship.util.js`, `Competition.maxTeamSize`, `coach.service.js`/`super-admin.service.js` (`hasRoomInSquad`) |
+| Change which apparatus a gender competes on | `03-DOMAIN-MODEL.md`, `modules/utils.md` | `src/utils/data/competition-apparatus.util.js`, `Competition.apparatusByGender` |
+| Change panel seats (Time Keeper, Scorer, who may share) | `03-DOMAIN-MODEL.md`, `08-REALTIME-SOCKETS.md` (`time_record`) | `src/config/judge-seats.js`, `src/utils/data/judge-assignment.util.js` (`MINIMUM_PANEL_SEATS`) |
+| Change the score-submission write path | `07-SCORING-ENGINE.md`, `04-DATA-MODEL.md` (Score) | `src/services/scoring/scoring.service.js` (`saveScores`), `src/controllers/admin.controller.js` |
+| Add a field to Competition/Score/Player/etc. | `CHANGE-RECIPES.md#add-entity-field`, `04-DATA-MODEL.md`, `03-DOMAIN-MODEL.md` | the model, its validator, `utils/data/user-projection.util.js` |
+| Add a role or permission | `CHANGE-RECIPES.md#add-role-or-permission`, `06-AUTH-AND-SECURITY.md` | `src/middleware/auth.middleware.js` |
+| Add a socket event | `CHANGE-RECIPES.md#add-socket-event`, `08-REALTIME-SOCKETS.md` | `src/socket/events/event-types.js`, the relevant handler |
+| Add a migration | `CHANGE-RECIPES.md#add-migration`, `04-DATA-MODEL.md` | `src/migrations/migration-template.js` |
+| Add a config/env var | `CHANGE-RECIPES.md#add-config-env-var`, `12-CONFIG-AND-ENV.md` | `src/config/config-manager.js` |
+| Add a validator rule | `CHANGE-RECIPES.md#add-validator-rule`, `modules/validators.md` | the domain's `*.validator.js`, `common.validator.js` |
+| Add a cached read | `CHANGE-RECIPES.md#add-cached-read`, `10-CACHING-AND-PERF.md` | the owning service, `cache.service.js` |
+| Add a background/seed/perf script | `CHANGE-RECIPES.md#add-background-script`, `13-SCRIPTS-AND-OPS.md` | `scripts/`, `scripts/lib/setup-chain.js` |
+| Write a test | `14-TESTING.md` | the matching `tests/{unit,integration,security}/` file |
+| Change Player IDs, guardian / no-email players, or who approves their resets | `modules/accounts.md`, `03-DOMAIN-MODEL.md` (invariant 8) | `src/utils/data/player-login-id.util.js`, `src/models/Player.js`, `src/services/auth/account-request.service.js` |
+| Change the account page (profile edit, password change, email change) | `modules/accounts.md` §2 | `src/services/auth/account.service.js`, `src/validators/account.validator.js` |
+| Change how a coach registers a no-email player or their default password | `modules/accounts.md` §4 | `src/services/user/coach-player.service.js`, `src/utils/security/data-encryption.util.js` |
+| Change the walk-in desk, its form, or the OCR sidecar | `modules/walk-in-desk.md` | `src/services/walk-in/*`, `src/utils/walk-in/*`, `../ocr/` |
+| Change who may enter which age group (COP 1.8.3) | `modules/walk-in-desk.md` (Age rule), `03-DOMAIN-MODEL.md` (invariant 9) | `src/config/cop-rules.js` + `Web/src/utils/competition/ageEligibility.js` (a drift test pins them together) |
+| Change password reset or outgoing email | `06-AUTH-AND-SECURITY.md#forgot-password--otp--reset`, `modules/email.md` | `src/services/auth/{authentication,otp}.service.js`, `src/services/email/*` — prod on Render must use `gmail-api` |
+| Change login/token/cookie/CSRF/rate-limit behavior | `06-AUTH-AND-SECURITY.md`, `modules/auth.md` | `src/middleware/{auth,csrf,security}.middleware.js`, `src/services/auth/*` |
+| Change competition scope or the end-date lock | `06-AUTH-AND-SECURITY.md`, `modules/competition.md` | `src/middleware/competition-{context,lock}.middleware.js`, `src/utils/security/competition-{access,lock}.util.js` |
+| Change registration/payment/discount/fee logic | `09-PAYMENTS.md`, `modules/payment.md` | `src/config/payment.config.js`, `src/services/payment/*`, `coach.service.js`/`super-admin.service.js` payment methods |
+| Change judge panel seating | `07-SCORING-ENGINE.md` (judge services section) | `src/services/user/judge-panel.service.js` |
+| Change the running order / lot draw | `07-SCORING-ENGINE.md` | `src/services/competition/performance-order.service.js` |
+| Debug a socket broadcast that never arrives | `08-REALTIME-SOCKETS.md`, `GOTCHAS.md` | check whether the target room is ever joined **before** assuming the emit is broken |
+| Debug startup/shutdown/index/migration behavior | `01-ARCHITECTURE.md`, `modules/infrastructure.md` | `scripts/startup.js`, `src/infrastructure/database/*` |
+| Debug logging/metrics/health | `11-OBSERVABILITY.md` | `src/infrastructure/{logger,health-monitor}.js`, `src/infrastructure/prometheus/` |
+| Deploy or roll back | `15-DEPLOYMENT.md` | `render.yaml` |
+| Operate production on OCI (live since 2026-11-17) | `15-DEPLOYMENT.md` ("Move off Render") | repo-root `deploy/README.md`, `deploy/COMMON.md` (findings, phases C0–C9), `deploy/oci/PLAN.md` (its "what was actually built" box wins); finished plans in `deploy/oci/archive/` |
+| Change the nightly e2e (throw-away `_e2e` DB) | `12-CONFIG-AND-ENV.md` (`EMAIL_PROVIDER=none`, `LOG_DIR`), `13-SCRIPTS-AND-OPS.md` (`SEED_SEASON_LEAD_DAYS`, `SETUP_LOCK_PATH`) | `src/services/email/none.adapter.js`, `scripts/lib/{meets,setup-chain}.js`, repo-root `deploy/oci/` |
+| Email won't send, or the server won't boot after copying `.env_example` | `modules/email.md`, `GOTCHAS.md` | `src/services/email/gmail-api.adapter.js`, `.env_example` |
+| Check whether a README/doc claim is trustworthy | `GOTCHAS.md` | — several `docs/*.md` files are severely stale, see the list there before citing one |
+
+## `covers:` is the staleness contract
+
+Every doc's frontmatter lists `covers:` globs. **When you change a file,
+open the doc(s) whose `covers` match and update them in the same change.**
+Bump `last_verified` and `verified_against_commit`. A MEMORY doc that
+contradicts the code is worse than no doc — if you can't verify a section,
+mark it `⚠️ STALE` rather than leaving it to be trusted. `_COVERAGE.md`
+tracks what's been read; update it if you add a new in-scope file.
+
+## Doc list
+
+`01-ARCHITECTURE` · `02-CONVENTIONS` · `03-DOMAIN-MODEL` · `04-DATA-MODEL` ·
+`05-API-SURFACE` · `06-AUTH-AND-SECURITY` · `07-SCORING-ENGINE` ·
+`08-REALTIME-SOCKETS` · `09-PAYMENTS` · `10-CACHING-AND-PERF` ·
+`11-OBSERVABILITY` · `12-CONFIG-AND-ENV` · `13-SCRIPTS-AND-OPS` ·
+`14-TESTING` · `15-DEPLOYMENT` · `CHANGE-RECIPES` · `GOTCHAS` ·
+`modules/{user-services,team,auth,accounts,competition,payment,public,cache,
+feature-flags,scoring,socket,middleware,repositories,infrastructure,
+migrations,validators,utils,walk-in-desk}` · `_COVERAGE`.
+
+## Worked cold-start traces
+
+**"Add an optional `tiebreakNote` field to a score and expose it on the
+public leaderboard."** → Index row "Add a field to Competition/Score/...".
+Opens `04-DATA-MODEL.md` (Score section — finds `playerScoreSchema`, notes
+`tieBreakResolution` already exists but nothing writes it, a useful
+precedent), `03-DOMAIN-MODEL.md` (confirms Score's identity/lock rules
+aren't affected by adding a display-only field). Then: add the field to
+`src/models/Score.js`; it needs to survive `saveScores`' merge logic
+(`07-SCORING-ENGINE.md`'s trace shows identity fields are excluded from
+`$set` but other fields merge — this one isn't an identity field, safe);
+`09-PAYMENTS.md`/`07-SCORING-ENGINE.md` aren't otherwise touched. To expose
+it publicly: `modules/public.md` shows `getPublicScores` strips slip
+breakdowns and projects specific fields — add it to that projection, and
+check `utils/data/user-projection.util.js` isn't stripping it. **Result**:
+the index correctly routes to 04/03/07/public.md and flags the exact merge
+function and the exact projection point to touch — no wrong turn.
+
+**"Rate-limit the coach registration endpoint separately."** → Index row
+"...role/permission" is close but not quite it; the real hit is
+`06-AUTH-AND-SECURITY.md`'s Rate Limiting section, which explains the three
+existing limiters and *why* there's no global one. It shows `userLimiter` is
+already applied to all of `/api/coaches` including registration, and that a
+*new*, narrower limiter would follow the `judgeLoginLimiter` pattern
+(keyed by identifier, not IP, to avoid punishing a shared venue NAT — though
+registration isn't a venue-shared endpoint, so a per-IP `authLimiter`-style
+limiter is more likely correct here). Opens `src/middleware/security.middleware.js`
+(the `createXRateLimitMiddleware` factory pattern) and `src/routes/coach.routes.js`
++ `routes/index.js` (where `authLimiter` is currently attached to
+`/register`+`/login` together) to actually split them. **Result**: the index
+gets you to the right doc even though no row says "rate limit" verbatim,
+because 06's own content anticipates the question.
+
+**"Emit a socket event when a competition is locked."** → Index row "Add a
+socket event" **and** "Debug a socket broadcast that never arrives" both
+apply — reading both is correct. `08-REALTIME-SOCKETS.md` immediately
+surfaces the load-bearing fact: no socket joins a `competition_*` room
+today, so naively adding `emitToRoom('competition_${id}', ...)` would ship a
+broadcast nobody receives, exactly like the existing dead
+`TEAM_APPROVED`/`AGE_GROUP_STARTED` emitters `GOTCHAS.md` documents. The
+correct fix requires **either** adding a join mechanism for that room first,
+**or** using `emitToUser` per-recipient (needs a list of who to notify —
+admins assigned to the competition, via `Admin.competitions[]`). This is
+exactly the kind of wrong-turn the index and `GOTCHAS.md` together are
+supposed to prevent — a naive implementation would silently do nothing.
+
+## Since the last pass (2026-11-11, against `f5465b4`)
+
+Refreshed against `f5465b4` (2026-11-11). Main changes since then:
+- The 2026-10-31 security-audit fixes (`/api/scoring` deleted, hashed reset
+  codes, per-account limits that are now off by default, persisted logouts).
+- One Super Admin, the owner, with the Fix / History correction tools. See
+  the new [modules/superadmin-corrections.md](modules/superadmin-corrections.md).
+- Co-coaches.
+- Per-role session cookies.
+- New judging rules: an extra element fills one lower Difficulty slot,
+  Execution must be at least 0.10, at most 3 edits per slip, and the Senior
+  Judge override is removed.
+- Scorer: may edit only Time and Other Deduction; panel size is counted from
+  the seats.
+- Admin and superadmin can unlock the judges' scores and restore edits.
+- Seven competition levels.
+- Live running order for the Scorer and Time Keeper.
+- `seed:demo`.
+
+| Path | Purpose |
+|---|---|
+| `src/services/superadmin/`, `src/routes/superadmin-corrections.routes.js`, `src/utils/auth/team-coach.util.js` | Owner corrections, History/undo, co-coaches, player transfer — [modules/superadmin-corrections.md](modules/superadmin-corrections.md) |

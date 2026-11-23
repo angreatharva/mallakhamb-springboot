@@ -1,0 +1,30 @@
+# Filled-in OCI env files hold secrets (deploy/oci/scripts/03-env-secret.md)
+staging-app.env
+*-app.env
+!*.env.example
+
+# Local env files (real secrets). Examples stay tracked.
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Gradle / Java build output (anywhere, incl. mallakhamb-backend/build/golden-full: >100 MB vector sets)
+build/
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+*.class
+*.log
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json

@@ -1,0 +1,259 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api-e2e-full",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "Object.assign(process.env,{PORT:'5001',MONGODB_URI:'mongodb://127.0.0.1:27017/mallakhamb_deskv2_e2e',BACKUP_URI:'mongodb://127.0.0.1:27017/mallakhamb_deskv2_e2e',NODE_ENV:'development',MIGRATE_ON_START:'false',RATE_LIMIT_ENABLED:'false',EMAIL_PROVIDER:'none',EMAIL_CAPTURE:'true',RAZORPAY_KEY_ID:'',RAZORPAY_KEY_SECRET:'',DISCOUNT_CODE_ENABLED:'true',DISCOUNT_CODE:'E2EFULLLOCAL',METRICS_TOKEN:'e2e-local-metrics',SEED_SEASON_LEAD_DAYS:'14',OCR_URL:'http://127.0.0.1:8090',OCR_TOKEN:'test-token',KEEP_ALIVE:'false'});require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5001,
+      "//": "The nightly e2e chain locally, in full: throw-away mallakhamb_deskv2_e2e, mail captured, discount on, metrics on (coverage step), OCR sidecar on 8090 (walkin step; start ocr/ with OCR_TOKEN=test-token). Run setupApi.js with the same env (see Server/MEMORY 15-E2E notes)."
+    },
+    {
+      "name": "web-e2e-full",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.VITE_API_URL='http://localhost:5001/api';require('child_process').spawn('npx',['vite','--port','5178','--strictPort'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Web",
+      "port": 5178,
+      "//": "The SPA against api-e2e-full (:5001), for the Playwright specs: E2E_BASE_URL=http://localhost:5178 E2E_API_URL=http://localhost:5001/api."
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "cwd": "Web",
+      "port": 5173
+    },
+    {
+      "name": "web-preview",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "preview",
+        "--",
+        "--port",
+        "4173",
+        "--strictPort"
+      ],
+      "cwd": "Web",
+      "port": 4173,
+      "//": "The production build (npm run build first): what Render serves. Used by npm run audit:home."
+    },
+    {
+      "name": "look-frozen",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "vite",
+        "preview",
+        "--outDir",
+        "../../.mk-look-builds/serve",
+        "--port",
+        "4174",
+        "--strictPort"
+      ],
+      "cwd": "Web",
+      "port": 4174,
+      "//": "A FROZEN production build for the design-language pixel gate (docs/design-language/PLAN.md Phase 0/1): copy a build into ../.mk-look-builds/serve, then run the audit with E2E_BASE_URL=http://localhost:4174. Source edits never reach it mid-run."
+    },
+    {
+      "name": "look-candidate",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "vite",
+        "preview",
+        "--outDir",
+        "../../.mk-look-builds/candidate",
+        "--port",
+        "4175",
+        "--strictPort"
+      ],
+      "cwd": "Web",
+      "port": 4175,
+      "//": "The candidate build beside look-frozen, for side-by-side computed-style checks."
+    },
+    {
+      "name": "web-crosssite",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.VITE_API_URL='http://127.0.0.1:5000/api';require('child_process').spawn('npx',['vite','--port','5174','--strictPort'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Web",
+      "port": 5174,
+      "//": "SPA on localhost, API on 127.0.0.1: two different SITES, so the API's cookies are third-party, exactly as on Render. Reproduces what iPhones (WebKit ITP) see."
+    },
+    {
+      "name": "api",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "start"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "Plain node, not nodemon: a watcher restarting mid-run is indistinguishable from the API being down."
+    },
+    {
+      "name": "api-local-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_identity_check';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "The API on the LOCAL mongod (a throwaway database, never Atlas) with email suppressed, for end-to-end browser checks. Run `npm run prepare:db` with the same MONGODB_URI first. .env is untouched: dotenv never overrides a variable that is already set."
+    },
+    {
+      "name": "api-metrics",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.METRICS_TOKEN='dev';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "The api entry with METRICS_TOKEN=dev, so GET /metrics answers locally (curl -H 'Authorization: Bearer dev'). Leaves .env untouched."
+    },
+    {
+      "name": "api-desk-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_desk_check';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';process.env.OCR_URL='http://127.0.0.1:8090';process.env.OCR_TOKEN='test-token';process.env.DISCOUNT_CODE_ENABLED='true';process.env.DISCOUNT_CODE='DESK-CHECK-FREE';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "The API on a throwaway LOCAL database with the walk-in desk's OCR sidecar (ocr/, started separately on 8090 with OCR_TOKEN=test-token) and a test discount code. Run prepare:db with the same MONGODB_URI first."
+    },
+    {
+      "name": "api-desk-v2-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_desk_v2';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';process.env.MIGRATE_ON_START='false';process.env.RATE_LIMIT_ENABLED='false';process.env.OCR_URL='http://127.0.0.1:8090';process.env.OCR_TOKEN='test-token';process.env.DISCOUNT_CODE_ENABLED='true';process.env.DISCOUNT_CODE='DESK-CHECK-FREE';process.env.RAZORPAY_KEY_ID='';process.env.RAZORPAY_KEY_SECRET='';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "Walk-in desk v2 browser check (unlock, Excel, register player): throwaway LOCAL mallakhamb_desk_v2, OCR sidecar on 8090 with OCR_TOKEN=test-token, test discount code. Sign-in in Server/desk-v2-check.local (git-ignored)."
+    },
+    {
+      "name": "web-local-api",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.VITE_API_URL='http://localhost:5000/api';require('child_process').spawn('npx',['vite','--port','5177','--strictPort'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Web",
+      "port": 5177,
+      "//": "The SPA against a local API on localhost:5000 (any api-*-check entry)."
+    },
+    {
+      "name": "api-stats-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_stats_check';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "The API on a throwaway LOCAL database seeded with four meets of published scores, for checking the profile Stats tabs and the Judge fairness board."
+    },
+    {
+      "name": "api-team-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_team_check';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "Throwaway local DB for the team-per-level browser check (seeded outside the repo)."
+    },
+    {
+      "name": "api-e2e-local",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.PORT='5001';process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_local_e2e';process.env.BACKUP_URI=process.env.MONGODB_URI;process.env.NODE_ENV='development';process.env.MIGRATE_ON_START='false';process.env.RATE_LIMIT_ENABLED='false';process.env.EMAIL_PROVIDER='none';process.env.EMAIL_CAPTURE='true';process.env.RAZORPAY_KEY_ID='';process.env.RAZORPAY_KEY_SECRET='';process.env.DISCOUNT_CODE_ENABLED='true';process.env.DISCOUNT_CODE='E2ELOCALRUN';process.env.SEED_SEASON_LEAD_DAYS='14';process.env.OCR_URL='';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5001,
+      "//": "The nightly e2e chain's API, locally: throw-away mallakhamb_local_e2e, no mail, discount on, rate limit off. Run setupApi.js against :5001 with the same env."
+    },
+    {
+      "name": "api-e2e-browse",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_local_e2e';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "Port 5000 on the local e2e chain database (mallakhamb_local_e2e), to look at a fully seeded season in the browser."
+    },
+    {
+      "name": "api-sa-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_sa_check';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';process.env.MIGRATE_ON_START='false';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "Throwaway LOCAL clone of mallakhamb_local_e2e for the Super Admin Fix/History browser check (docs/archive/superadmin-control-plan.md). Owner sign-in is in Server/sa-check.local (git-ignored)."
+    },
+    {
+      "name": "api-demo-local",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.PORT='5002';process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_demo';process.env.BACKUP_URI=process.env.MONGODB_URI;process.env.NODE_ENV='development';process.env.MIGRATE_ON_START='false';process.env.RATE_LIMIT_ENABLED='false';process.env.EMAIL_PROVIDER='none';process.env.RAZORPAY_KEY_ID='';process.env.RAZORPAY_KEY_SECRET='';process.env.DISCOUNT_CODE_ENABLED='true';process.env.DISCOUNT_CODE='DEMOSEED100';process.env.OCR_URL='';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5002,
+      "//": "The demo seed's rehearsal API (docs/archive/demo-seed-plan.md): local mallakhamb_demo, no mail, discount on. Run: DEMO_MONGODB_URI=mongodb://127.0.0.1:27017/mallakhamb_demo DEMO_DISCOUNT_CODE=DEMOSEED100 DEMO_SUPERADMIN_PASSWORD=... node scripts/seedDemo.js --drop --yes"
+    },
+    {
+      "name": "web-demo-local",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.VITE_API_URL='http://127.0.0.1:5002/api';require('child_process').spawn('npx',['vite','--port','5176','--strictPort'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Web",
+      "port": 5176,
+      "//": "The SPA against the demo rehearsal API (api-demo-local, :5002)."
+    },
+    {
+      "name": "api-demo-staging",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "const fs=require('fs');for(const l of fs.readFileSync('.env.demo','utf8').split(/\\r?\\n/)){const m=l.match(/^\\s*([A-Z_]+)\\s*=\\s*(.*)$/);if(m)process.env[m[1]]=m[2];}if(!process.env.DEMO_MONGODB_URI)throw new Error('Server/.env.demo needs DEMO_MONGODB_URI');process.env.PORT='5003';process.env.MONGODB_URI=process.env.DEMO_MONGODB_URI;process.env.BACKUP_URI=process.env.MONGODB_URI;process.env.NODE_ENV='development';process.env.MIGRATE_ON_START='false';process.env.RATE_LIMIT_ENABLED='false';process.env.EMAIL_PROVIDER='none';process.env.RAZORPAY_KEY_ID='';process.env.RAZORPAY_KEY_SECRET='';process.env.DISCOUNT_CODE_ENABLED='true';process.env.DISCOUNT_CODE=process.env.DEMO_DISCOUNT_CODE||'DEMOSEED100';process.env.OCR_URL='';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5003,
+      "//": "The demo seed's API against the staging database through the SSH tunnel (127.0.0.1:27018). Reads Server/.env.demo (git-ignored): DEMO_MONGODB_URI, DEMO_SUPERADMIN_EMAIL, DEMO_SUPERADMIN_PASSWORD, DEMO_DISCOUNT_CODE. No mail is sent from it."
+    },
+    {
+      "name": "api-scorer-check",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "-e",
+        "process.env.MONGODB_URI='mongodb://127.0.0.1:27017/mallakhamb_scorer_check';process.env.EMAIL_PROVIDER='none';process.env.NODE_ENV='development';process.env.MIGRATE_ON_START='false';process.env.RATE_LIMIT_ENABLED='false';require('child_process').spawn('npm',['start'],{stdio:'inherit',shell:true}).on('exit',c=>process.exit(c))"
+      ],
+      "cwd": "Server",
+      "port": 5000,
+      "//": "Throwaway LOCAL copy of mallakhamb_local_e2e for the Scorer view-only / time-lock / tolerance and Senior Judge mismatch-detail browser check."
+    }
+  ]
+}

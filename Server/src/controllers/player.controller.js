@@ -1,0 +1,104 @@
+/**
+ * Player Controller
+ *
+ * Full implementation replacing the stub (player_controller_stub.js).
+ * Handles player registration, login, profile, team assignment, and available teams.
+ *
+ * @module controllers/player.controller
+ */
+
+const { asyncHandler } = require('../middleware/error.middleware');
+const { sendLoginResponse } = require('../utils/security/login-response.util');
+const { isProductionLike } = require('../utils/security/cookie.util');
+
+function createPlayerController(container) {
+  const playerService = container.resolve('playerService');
+  const tokenService = container.resolve('tokenService');
+  const config = container.resolve('config');
+  const logger = container.resolve('logger');
+  const isProduction = isProductionLike(config);
+
+  return {
+    // ==================== Auth ====================
+
+    /** @route POST /api/player/register */
+    registerPlayer: asyncHandler(async (req, res) => {
+      const result = await playerService.registerPlayer(req.body);
+      await sendLoginResponse({
+        res, tokenService, isProduction,
+        data: result, userType: 'player',
+        statusCode: 201, message: 'Player registered successfully.',
+      });
+    }),
+
+    /** @route POST /api/player/login */
+    loginPlayer: asyncHandler(async (req, res) => {
+      // Email or Player ID; the validator puts either into `identifier`.
+      const { identifier, password } = req.body;
+      const result = await playerService.loginPlayer(identifier, password);
+      await sendLoginResponse({
+        res, tokenService, isProduction,
+        data: result, userType: 'player',
+      });
+    }),
+
+    // ==================== Profile ====================
+
+    /** @route GET /api/player/profile */
+    getPlayerProfile: asyncHandler(async (req, res) => {
+      const player = await playerService.getPlayerProfile(req.user._id);
+      res.json({ success: true, data: player });
+    }),
+
+    // ==================== Team ====================
+
+    /** @route GET /api/player/team */
+    getPlayerTeam: asyncHandler(async (req, res) => {
+      const result = await playerService.getPlayerTeam(req.user._id, req.competitionId);
+      res.json({ success: true, data: result });
+    }),
+
+    /** @route POST /api/player/team/join */
+    joinTeam: asyncHandler(async (req, res) => {
+      const { teamId, competitionId, level } = req.body;
+      const result = await playerService.joinTeam(req.user._id, teamId, competitionId, { level });
+      res.json({ success: true, data: result, message: 'Successfully joined team.' });
+    }),
+
+    /**
+     * The player's team at one level — final, or a suggestion.
+     * @route GET /api/players/team/level?level=district
+     */
+    getTeamAtLevel: asyncHandler(async (req, res) => {
+      const data = await playerService.getTeamAtLevel(req.user._id, req.query.level);
+      res.json({ success: true, data });
+    }),
+
+    /**
+     * Lists teams available to join.
+     * Scoped to a specific competition if provided, otherwise all open competitions.
+     * @route GET /api/player/teams/available
+     */
+    getAvailableTeams: asyncHandler(async (req, res) => {
+      const competitionId = req.competitionId || req.query.competitionId;
+      // Level → Team → Competition: the player's chosen level narrows the list
+      // to teams entered in a meet at that level.
+      const level = typeof req.query.level === 'string' ? req.query.level : null;
+      const teams = await playerService.getAvailableTeams(competitionId, { level });
+      res.json({ success: true, data: teams });
+    }),
+
+    /**
+     * Get open competitions available for players to join
+     * @route GET /api/players/competitions/open
+     */
+    getOpenCompetitions: asyncHandler(async (req, res) => {
+      // Reuse the coach service method since it's the same logic
+      const competitionService = container.resolve('competitionService');
+      const competitions = await competitionService.getOpenCompetitions();
+      res.json({ success: true, data: competitions });
+    }),
+  };
+}
+
+module.exports = createPlayerController;

@@ -1,0 +1,1523 @@
+# GENERATED from apply-alerts.js by export-yaml.js. Do not edit by hand.
+# Group mallakhamb-oci-staging: the nightly e2e alerts for the OCI staging servers, LIVE now
+# (pasted with PLATFORM='render'); deleted at the cutover, when the main group carries them.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: mallakhamb-oci-staging
+    folder: Mallakhamb
+    interval: 1m
+    rules:
+      - uid: mk-host-missing-stg
+        title: Host metrics missing
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          service: mallakhamb-api
+          severity: critical
+        annotations:
+          summary: No host metrics from the active server for 10 minutes.
+          description: >-
+            Alloy on the active has stopped (systemctl status alloy; journalctl -u alloy), its Grafana token was
+            revoked, or the VM is down; check "API down" too. Console → Instances: if it is STOPPED (Oracle idle
+            reclaim) the Resource Scheduler starts it within 30 min; to serve sooner, or if the start fails (no A1
+            capacity), fail over. deploy/oci/archive/IDLE-RECLAIM-PLAN.md §3C. If the VM is gone: deploy/oci/PLAN.md
+            O13. Runbook: PLAN.md §8.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'absent(up{scrape_job="mallakhamb-host"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-e2e-failed-stg
+        title: E2E failed
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'The full-season e2e check failed on {{ $labels.instance }} (exit {{ $values.A.Value }}).'
+          description: >-
+            A real flow broke on that release (registration, squads, payment, panels, scoring or publishing), or the e2e
+            database/Atlas user is wrong. First look, on that VM: journalctl -u mallakhamb-e2e -n 200 (the step report
+            is at the end), then /var/log/mallakhamb-e2e. Fix before the next meet. Runbook: PLAN.md §8.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'max by (instance) (mallakhamb_e2e_last_exit_code{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-e2e-stale-stg
+        title: E2E stale
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'The e2e check has not run on {{ $labels.instance }} for more than 20 hours.'
+          description: >-
+            Each VM runs two of the four daily slots (its role decides which), and a skip — a meet today or tomorrow, a
+            busy API, a desk in use, NO_E2E — still counts as a run. So this means the timer stopped, or the VM kept the
+            wrong role for a day: systemctl status mallakhamb-e2e.timer mallakhamb-e2e; a run longer than 1 h is killed
+            (TimeoutStartSec). Runbook: PLAN.md §8.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() - max by (instance)
+                (mallakhamb_e2e_last_run_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 72000
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-standby-missing-stg
+        title: Standby missing
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'No metrics from the warm standby for 30 minutes: there is nothing to fail over to.'
+          description: >-
+            Over the Bastion on the standby: systemctl status alloy. If the VM is stopped (Oracle idle reclaim: the
+            Resource Scheduler starts it within 30 min, IDLE-RECLAIM-PLAN.md §3C) or gone, rebuild it from the golden
+            backup (deploy/oci/PLAN.md O12). Runbook: PLAN.md §8.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'absent(up{scrape_job="mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-no-primary-stg
+        title: MongoDB has no primary
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          service: mallakhamb-api
+          severity: critical
+        annotations:
+          summary: 'No replica-set member sees a PRIMARY: nothing can be written.'
+          description: >-
+            Two of three members are down or cut off from each other. On each VM over the Bastion: systemctl status
+            mongod; journalctl -u mongod -n 100. Bring a second member back and the set elects a primary by itself. Only
+            if two members are gone for good: forced reconfig to the survivor (owner decision; it can undo unreplicated
+            writes). Runbook: deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max(mallakhamb_mongo_primary_present{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-members-missing-stg
+        title: MongoDB members not all answering
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'Only {{ $values.A.Value }} of the 3 replica-set members answer their health check.'
+          description: >-
+            One member's mongod, VM or collector is down. Writes continue while two of three are up, but the next loss
+            stops them. On the missing VM: systemctl status mongod mallakhamb-mongo-metrics.timer alloy. Runbook:
+            deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                count(mallakhamb_mongo_up{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"} == 1) or
+                vector(0)
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 3
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-member-unhealthy-stg
+        title: MongoDB member not healthy
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'A replica-set member is not PRIMARY or SECONDARY (down, recovering or unreachable).'
+          description: >-
+            See which in mallakhamb_mongo_member_state (8 = down, 3 = recovering, 6 = unknown). On that VM: journalctl
+            -u mongod -n 100. A member that fell off the oplog needs a resync (empty its dbPath and restart). Runbook:
+            deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                count(max by (member)
+                (mallakhamb_mongo_member_state{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"}) !=
+                1 != 2) or vector(0)
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-lag-stg
+        title: MongoDB replication lag
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'A member is {{ humanizeDuration $values.A.Value }} behind the primary.'
+          description: >-
+            Usually db-03 (the 1/8-OCPU micro) under heavy writes, or a slow disk. Harmless while app-01 and app-02 both
+            run; with one of them down it slows every majority write. Runbook:
+            deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max(mallakhamb_mongo_replication_lag_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 30
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-oplog-window-stg
+        title: MongoDB oplog window short
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: The oplog holds less than 48 h of history.
+          description: >-
+            A member down longer than the window must be resynced, and point-in-time restore depends on the slices
+            keeping up. Raise replication.oplogSizeMB in install-mongo.sh (rolling restart) or find what writes so much.
+            Runbook: deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                min(mallakhamb_mongo_oplog_window_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 172800
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-connections-stg
+        title: MongoDB connections high
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: '{{ $values.A.Value }} open connections on one member.'
+          description: >-
+            The API pool is up to 100 per process; more means a leak, a reconnect storm, or several API processes.
+            Runbook: deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max(mallakhamb_mongo_connections_current{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 300
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-rollback-stg
+        title: MongoDB rollback files
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: A failover undid writes that had not reached a majority (files in mongod rollback/).
+          description: >-
+            The app writes with w:"majority", so these should never be acknowledged writes. Look at
+            /var/lib/mongodb/rollback on that member (bsondump) before deleting. Runbook:
+            deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max(mallakhamb_mongo_rollback_files{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-disk-stg
+        title: MongoDB member disk filling
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'The root disk of {{ $labels.instance }} is more than 80 % full ({{ humanizePercentage $values.A.Value }}).'
+          description: >-
+            At 100 % mongod on that member stops (drilled: it recovers by itself once space is freed). First look on
+            that VM: sudo du -xh / --max-depth=2 | sort -h | tail; journalctl --disk-usage; /var/log/mongodb. Runbook:
+            deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max by (instance) (1 -
+                node_filesystem_avail_bytes{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db",mountpoint="/"}
+                /
+                node_filesystem_size_bytes{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db",mountpoint="/"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0.8
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-data-size-stg
+        title: Database growing past the free-tier plan
+        condition: C
+        for: 1h
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: >-
+            The application database is {{ humanize1024 $values.A.Value }}B (plan §4a alerts at 250 MB, Atlas M0 copy
+            limit 512 MB).
+          description: >-
+            Check plan §4a: the M0 off-site copy, the bucket and db-03 run out first. Look for files or logs stored in
+            MongoDB.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'max(mallakhamb_mongo_db_bytes{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 250000000
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-oplog-slice-stale-stg
+        title: Point-in-time backups stalled
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: No oplog slice for more than 40 minutes.
+          description: >-
+            On the active: systemctl status mallakhamb-oplog-slice.timer; journalctl -u mallakhamb-oplog-slice -n 50.
+            Point-in-time restore cannot go past the last slice. Runbook: deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md
+            §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() -
+                max(mallakhamb_oplog_slice_last_success_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 2400
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-pitr-base-stale-stg
+        title: Point-in-time base stale
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: No point-in-time base dump for more than 26 hours.
+          description: >-
+            The first slice of each UTC day takes the base; see journalctl -u mallakhamb-oplog-slice. Runbook:
+            deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() -
+                max(mallakhamb_pitr_base_last_success_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 93600
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-offsite-stale-stg
+        title: Off-site copy stale
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: The hourly copy to Atlas has not succeeded for 3 hours.
+          description: >-
+            On the active: journalctl -u mallakhamb-offsite-copy -n 50. Usually Atlas's network access list (the
+            active's public IP), the Atlas user, or M0's 512 MB limit. This copy is the way out if Oracle is lost.
+            Runbook: deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() -
+                max(mallakhamb_offsite_last_success_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 10800
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-e2e-left-stg
+        title: E2E database left behind
+        condition: C
+        for: 6h
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: The nightly e2e database still exists 6 hours after a passing run.
+          description: >-
+            The run drops it after a pass (a failed run keeps it for inspection). Cleanup broke: journalctl -u
+            mallakhamb-e2e -n 50; it is excluded from backups but takes space.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max(mallakhamb_mongo_e2e_db_present{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+                > 0 and on() max(mallakhamb_e2e_last_exit_code{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})
+                == 0
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-vm-db-missing-stg
+        title: db-03 VM silent
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'No metrics from db-03, the replica set third member, for 10 minutes.'
+          description: >-
+            Console → Instances → mallakhamb-prod-db-03. STOPPED (Oracle idle reclaim, or a manual stop): the Resource
+            Scheduler starts it within 30 min; the set keeps its primary on 2 of 3 members meanwhile, but the next loss
+            stops writes. Running: systemctl status alloy over the Bastion. Runbook:
+            deploy/oci/archive/IDLE-RECLAIM-PLAN.md §3C.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'absent(up{scrape_job="mallakhamb-db"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-oci-cost-actual-stg
+        title: OCI is charging money
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          service: mallakhamb-api
+          severity: critical
+        annotations:
+          summary: 'OCI has charged {{ $values.A.Value }} SGD this month. Always Free should cost nothing.'
+          description: >-
+            Something paid exists or a free limit was crossed. Console → Billing & Cost Management → Cost Analysis,
+            grouped by service, to find it; then delete or shrink it. The root quota mallakhamb-prod-quota-free-tier
+            should make this impossible, so also check whether the quota changed. Runbook:
+            deploy/oci/PRODUCTION-READINESS.md 1.2.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'max(mallakhamb_oci_cost_actual{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-oci-cost-forecast-stg
+        title: OCI forecast over the budget
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'OCI forecasts this month at {{ humanizePercentage $values.A.Value }} of the SGD 1.50 guard.'
+          description: >-
+            Something will be billed before the month ends. Cost Analysis → forecast, grouped by service. Runbook:
+            deploy/oci/PRODUCTION-READINESS.md 1.2.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                max(mallakhamb_oci_cost_forecast{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"}) /
+                max(mallakhamb_oci_budget_amount{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 1
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-oci-cost-stale-stg
+        title: OCI cost data stale
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'The OCI budget has not been read for more than 3 hours, so the cost alerts are blind.'
+          description: >-
+            On either app VM: sudo mallakhamb-oci-cost (prints the error); journalctl -u mallakhamb-oci-cost. Usually
+            the policy mallakhamb-prod-pol-budget-read, or the budget mallakhamb-guard was renamed or deleted. OCI still
+            emails its own budget alerts meanwhile.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() -
+                max(mallakhamb_oci_cost_updated_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 10800
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-auto-failover-stg
+        title: Automatic failover happened
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          service: mallakhamb-api
+          severity: critical
+        annotations:
+          summary: The standby took over the site in the last hour because the active VM was gone.
+          description: >-
+            The site should be up on the other VM. Find out why the old active died (Console → Instances; OCI audit;
+            journalctl on it once it is back). When it returns it demotes itself. Fail back in a quiet window: sudo
+            mallakhamb-role takeover on the VM that should be active. Runbook: deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() -
+                max(mallakhamb_role_auto_failover_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 3600
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-no-holder-stg
+        title: Site IP attached to no VM
+        condition: C
+        for: 3m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          service: mallakhamb-api
+          severity: critical
+        annotations:
+          summary: 'Neither app VM holds the site''s reserved IP (137.23.63.84): the site is unreachable.'
+          description: >-
+            Cloud Shell: bash ~/service-ip-setup.sh status. Put it back: sudo mallakhamb-role takeover on the VM that
+            should be active, or deploy/oci/scripts/failover-ip.sh move <nn>. Runbook: deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'max(mallakhamb_role_holds_service_ip{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-two-active-stg
+        title: Two app VMs configured active
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: Both app VMs run as the active (no STANDBY marker) for 5 minutes.
+          description: >-
+            Only the IP holder gets traffic, but both take backups. The non-holder's mallakhamb-role should demote it
+            within a minute: journalctl -u mallakhamb-role -n 30 on it; is it in observe mode, or blind to OCI? Runbook:
+            deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'sum(mallakhamb_role_is_active{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 1
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-judging-stg
+        title: Standby thinks the active is gone
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'The standby has counted {{ $values.A.Value }} ticks of the active looking gone (it takes over at 6).'
+          description: >-
+            Early warning. journalctl -u mallakhamb-role -n 20 on the standby shows why (site, OCI state, both database
+            views). To stop a takeover during planned work: sudo touch /etc/mallakhamb/NO_AUTO_FAILOVER on the standby.
+            Runbook: deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'max(mallakhamb_role_failover_bad_ticks{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-stale-stg
+        title: Role reconciler not running
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: mallakhamb-role has not run on one app VM for more than 5 minutes.
+          description: >-
+            Automatic failover and self-demotion are off on that VM. systemctl status mallakhamb-role.timer; journalctl
+            -u mallakhamb-role -n 30. Runbook: deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                time() -
+                min(mallakhamb_role_reconcile_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 300
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-oci-blind-stg
+        title: Automatic failover cannot see OCI
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'An app VM cannot ask OCI who holds the site''s IP, so it can neither take over nor step aside.'
+          description: >-
+            On that VM: sudo mallakhamb-role status. Usually the policy mallakhamb-prod-pol-failover, or OCI's API is
+            unreachable. Backups fall back to the STANDBY marker meanwhile. Runbook: deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'min(mallakhamb_role_oci_ok{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-role-observe-stg
+        title: Automatic failover only observing
+        condition: C
+        for: 1h
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'mallakhamb-role runs in observe mode on an app VM: it logs decisions but will not take over.'
+          description: >-
+            Intended only while testing. Set ROLE_MODE=act in /etc/mallakhamb/role.env on both app VMs. Runbook:
+            deploy/oci/AUTO-FAILOVER.md.
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: 'min(mallakhamb_role_mode_act{scrape_job=~"mallakhamb-host|mallakhamb-host-standby"})'
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
+      - uid: mk-mongo-cert-expiry-stg
+        title: MongoDB member certificate expiring
+        condition: C
+        for: 1h
+        noDataState: OK
+        execErrState: KeepLast
+        labels:
+          service: mallakhamb-api
+          severity: warning
+        annotations:
+          summary: 'A replica-set member certificate expires in {{ humanizeDuration $values.A.Value }}.'
+          description: >-
+            When it expires the members refuse each other and the set falls apart. Re-issue from the private CA (Vault
+            secrets mallakhamb-prod-bom-secret-mongo-*, deploy/server/mongo-tls-fetch.sh) and restart one member at a
+            time. Runbook: deploy/oci/archive/MONGODB-SELF-HOSTED-PLAN.md §2 (failure matrix).
+          runbook_url: >-
+            https://github.com/angreatharva/mallakhamb/blob/master/deploy/monitoring/PLAN.md#8-runbook--when-an-alert-fires
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: grafanacloud-prom
+            model:
+              refId: A
+              expr: >-
+                min(mallakhamb_mongo_member_cert_expiry_timestamp_seconds{scrape_job=~"mallakhamb-host|mallakhamb-host-standby|mallakhamb-db"})
+                - time()
+              instant: true
+              range: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: grafanacloud-prom
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 5184000
+              datasource:
+                type: __expr__
+                uid: __expr__
+        isPaused: false
